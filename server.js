@@ -3,14 +3,24 @@ const mysql = require("mysql2/promise");
 
 const app = express();
 app.use(express.json());
+app.use((req, res, next) => {
+  const token = req.headers.authorization?.replace("Bearer ", "");
+
+  if (!token || token !== process.env.API_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  next();
+});
+
 
 async function getDB() {
   return mysql.createConnection({
-    host: "nozomi.proxy.rlwy.net",
-    port: 48883,
-    user: "root",
-    password: "KFHgduBLQzgESYpgxDMBpqgMaVZOfzqB",
-    database: "railway",
+    host: process.env.MYSQL_HOST,
+    port: process.env.MYSQL_PORT,
+    user: process.env.MYSQL_USER,
+    password: process.env.MYSQL_PASSWORD,
+    database: process.env.MYSQL_DATABASE,
   });
 }
 
