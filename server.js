@@ -19,7 +19,7 @@ console.log("Deployment test");
 async function getDB() {
   return mysql.createConnection({
     host: process.env.MYSQL_HOST,
-    port: 48883,
+    port: process.env.MYSQL_PORT,
     user: "root",
     password: "KFHgduBLQzgESYpgxDMBpqgMaVZOfzqB",
     database: "railway",
