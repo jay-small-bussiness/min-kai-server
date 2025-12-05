@@ -2,16 +2,6 @@ const express = require("express");
 const mysql = require("mysql2/promise");
 
 const app = express();
-app.use(express.json());
-app.use((req, res, next) => {
-  const token = req.headers.authorization?.replace("Bearer ", "");
-
-  if (!token || token !== process.env.API_KEY) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-
-  next();
-});
 
 console.log("Deployment test");
 
