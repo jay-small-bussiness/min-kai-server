@@ -14,7 +14,6 @@ app.use((req, res, next) => {
 });
 
 console.log("Deployment test");
-console.log("Deployment test");
 
 async function getDB() {
   return mysql.createConnection({
