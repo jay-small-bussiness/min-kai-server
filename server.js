@@ -7,7 +7,7 @@ console.log("Deployment test");
 
 async function getDB() {
   return mysql.createConnection({
-    host: "nozomi.proxy.rlwy.net",
+    host: process.env.MYSQL_HOST,
     port: 48883,
     user: "root",
     password: "KFHgduBLQzgESYpgxDMBpqgMaVZOfzqB",
