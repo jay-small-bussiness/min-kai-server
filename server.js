@@ -80,6 +80,22 @@ app.post('/checklist', async (req, res) => {
   const { family_id, item_name, is_checked, updated_by } = req.body;
 
   try {
+    // ① 重複チェック
+    const [existRows] = await pool.query(
+      `SELECT item_id FROM shared_checklist
+       WHERE family_id = ? AND item_name = ? AND is_checked = 0`,
+      [family_id, item_name]
+    );
+
+    if (existRows.length > 0) {
+      // すでに未チェックで存在する → 新規追加せずそれを返す
+      return res.json({
+        status: "exists",
+        item_id: existRows[0].item_id
+      });
+    }
+
+    // ② 新規追加
     const [result] = await pool.query(
       `INSERT INTO shared_checklist 
         (family_id, item_name, is_checked, updated_by, updated_at)
@@ -87,18 +103,16 @@ app.post('/checklist', async (req, res) => {
       [family_id, item_name, is_checked, updated_by]
     );
 
-    res.json({
+    return res.json({
       status: "ok",
       insertedId: result.insertId
     });
 
   } catch (err) {
-    console.error(err); 
+    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
-
-
 
 const port = 3000;
 app.listen(port, () => console.log(`API running on port ${port}`));
