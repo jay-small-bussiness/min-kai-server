@@ -81,16 +81,23 @@ app.post('/checklist', async (req, res) => {
 
   try {
     const [result] = await pool.query(
-      `INSERT INTO shared_checklist (family_id, item_name, is_checked, updated_by)
-       VALUES (?, ?, ?, ?)`,
+      `INSERT INTO shared_checklist 
+        (family_id, item_name, is_checked, updated_by, updated_at)
+       VALUES (?, ?, ?, ?, NOW())`,
       [family_id, item_name, is_checked, updated_by]
     );
 
-    res.json({ insertedId: result.insertId });
+    res.json({
+      status: "ok",
+      insertedId: result.insertId
+    });
+
   } catch (err) {
+    console.error(err); 
     res.status(500).json({ error: err.message });
   }
 });
+
 
 
 const port = 3000;
