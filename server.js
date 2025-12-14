@@ -114,5 +114,51 @@ app.post('/checklist', async (req, res) => {
   }
 });
 
+// PUT /checklist/:id
+app.put('/checklist/:id', async (req, res) => {
+  const { id } = req.params;
+  const { is_checked, updated_by } = req.body;
+
+  try {
+    const [result] = await pool.query(
+      `UPDATE shared_checklist
+       SET is_checked = ?, updated_by = ?, updated_at = NOW()
+       WHERE item_id = ?`,
+      [is_checked, updated_by, id]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: "Item not found" });
+    }
+
+    res.json({ status: "ok", updatedId: id });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+// DELETE /checklist/:id
+app.delete('/checklist/:id', async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const [result] = await pool.query(
+      `DELETE FROM shared_checklist WHERE item_id = ?`,
+      [id]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: "Item not found" });
+    }
+
+    res.json({ status: "ok", deletedId: id });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const port = 3000;
 app.listen(port, () => console.log(`API running on port ${port}`));
