@@ -78,7 +78,6 @@ app.get('/checklist/:familyId', async (req, res) => {
 
 app.post('/checklist', async (req, res) => {
   const { family_id, item_name, is_checked, updated_by } = req.body;
-console.log("BODY:", req.body);
 
   try {
     // ① 重複チェック
