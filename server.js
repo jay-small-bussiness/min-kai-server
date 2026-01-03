@@ -108,6 +108,40 @@ app.post("/shopping-list", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+app.get("/shopping-list", async (req, res) => {
+  const familyId = req.query.family_id;
+
+  if (!familyId) {
+    return res.status(400).json({ error: "family_id is required" });
+  }
+
+  try {
+    const sql = `
+      SELECT
+        id,
+        family_id,
+        item_id,
+        category_id,
+        name,
+        status,
+        is_memo,
+        added_at,
+        updated_at,
+        updated_by
+      FROM ShoppingListItem
+      WHERE family_id = ?
+      ORDER BY updated_at ASC
+    `;
+
+    const [rows] = await pool.query(sql, [familyId]);
+
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 app.post('/checklist', async (req, res) => {
   const { family_id, item_name, is_checked, updated_by } = req.body;
