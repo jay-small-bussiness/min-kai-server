@@ -75,6 +75,39 @@ app.get('/checklist/:familyId', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+app.post("/shopping-list", async (req, res) => {
+  const {
+    family_id,
+    item_id,
+    category_id,
+    name,
+    status,
+    updated_by
+  } = req.body;
+
+  try {
+    const sql = `
+      INSERT INTO ShoppingListItem
+        (family_id, item_id, category_id, name, status, is_memo, added_at, updated_at, updated_by)
+      VALUES
+        (?, ?, ?, ?, ?, 0, NOW(), NOW(), ?)
+    `;
+
+    await pool.query(sql, [
+      family_id,
+      item_id,
+      category_id,
+      name,
+      status,
+      updated_by
+    ]);
+
+    res.json({ status: "ok" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.post('/checklist', async (req, res) => {
   const { family_id, item_name, is_checked, updated_by } = req.body;
