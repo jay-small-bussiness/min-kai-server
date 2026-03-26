@@ -31,13 +31,7 @@ const pool = mysql.createPool({
 const VALID_PLANS = new Set(["Free", "Solo", "Family"]);
 let familyLookupColumn = null;
 const DEFAULT_VOICE_DAILY_LIMIT = 5;
-const DEFAULT_TRIAL_DAYS = 30;
-
-function addDays(date, days) {
-  const result = new Date(date);
-  result.setUTCDate(result.getUTCDate() + days);
-  return result;
-}
+const HARDCODED_TRIAL_ENDS_AT = "2026-04-25T00:00:00Z";
 
 function getVoiceTrialEndsAt(plan, now) {
   if (plan !== "Free") {
@@ -45,17 +39,14 @@ function getVoiceTrialEndsAt(plan, now) {
   }
 
   // Hardcoded for now. Replace with persisted install/trial data later.
-  return addDays(now, DEFAULT_TRIAL_DAYS).toISOString();
+  return HARDCODED_TRIAL_ENDS_AT;
 }
 
 function evaluateVoiceSearch(plan, now) {
   const trialEndsAt = getVoiceTrialEndsAt(plan, now);
   const dailyLimit = DEFAULT_VOICE_DAILY_LIMIT;
-  const usedToday = 0; // Hardcoded for now. Replace with per-user usage tracking later.
   const trialActive = trialEndsAt ? now < new Date(trialEndsAt) : false;
-  const remainingToday = trialActive
-    ? dailyLimit
-    : Math.max(0, dailyLimit - usedToday);
+  const remainingToday = dailyLimit;
 
   return {
     trialActive,
