@@ -28,9 +28,103 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 10,
 });
-
 const VALID_PLANS = new Set(["Free", "Solo", "Family"]);
 let familyLookupColumn = null;
+const DEFAULT_VOICE_DAILY_LIMIT = 5;
+const DEFAULT_TRIAL_DAYS = 30;
+
+function addDays(date, days) {
+  const result = new Date(date);
+  result.setUTCDate(result.getUTCDate() + days);
+  return result;
+}
+
+function getVoiceTrialEndsAt(plan, now) {
+  if (plan !== "Free") {
+    return null;
+  }
+
+  // Hardcoded for now. Replace with persisted install/trial data later.
+  return addDays(now, DEFAULT_TRIAL_DAYS).toISOString();
+}
+
+function evaluateVoiceSearch(plan, now) {
+  const trialEndsAt = getVoiceTrialEndsAt(plan, now);
+  const dailyLimit = DEFAULT_VOICE_DAILY_LIMIT;
+  const usedToday = 0; // Hardcoded for now. Replace with per-user usage tracking later.
+  const trialActive = trialEndsAt ? now < new Date(trialEndsAt) : false;
+  const remainingToday = trialActive
+    ? dailyLimit
+    : Math.max(0, dailyLimit - usedToday);
+
+  return {
+    trialActive,
+    trialEndsAt,
+    dailyLimit,
+    remainingToday,
+    restricted: !trialActive && remainingToday <= 0,
+  };
+}
+
+function buildRestrictionNotice(plan, voiceSearch) {
+  if (plan !== "Free") {
+    return {
+      title: "Voice search available",
+      body: "Your current plan can use voice search without Free-plan restrictions.",
+      campaignId: "voice-search-available",
+      actions: [
+        {
+          type: "dismiss",
+          label: "OK",
+        },
+      ],
+    };
+  }
+
+  if (voiceSearch.trialActive) {
+    return {
+      title: "Free trial is active",
+      body: "You can use voice search without daily limits during the trial period.",
+      campaignId: "free-trial-active",
+      actions: [
+        {
+          type: "dismiss",
+          label: "OK",
+        },
+      ],
+    };
+  }
+
+  if (voiceSearch.restricted) {
+    return {
+      title: "Voice search limit reached",
+      body: "Today's Free-plan voice-search limit has been reached.",
+      campaignId: "voice-limit-reached",
+      actions: [
+        {
+          type: "dismiss",
+          label: "OK",
+        },
+      ],
+    };
+  }
+
+  return {
+    title: "Voice search available",
+    body: "Voice search is available within today's Free-plan limit.",
+    campaignId: "voice-limit-available",
+    actions: [
+      {
+        type: "dismiss",
+        label: "OK",
+      },
+    ],
+  };
+}
+
+function buildScreenHelp() {
+  return {};
+}
 
 function normalizePlan(plan) {
   if (typeof plan !== "string") {
@@ -43,12 +137,17 @@ function normalizePlan(plan) {
 
 function buildPlanResponse(plan) {
   const normalizedPlan = normalizePlan(plan);
+  const now = new Date();
+  const voiceSearch = evaluateVoiceSearch(normalizedPlan, now);
 
   return {
     plan: normalizedPlan,
     features: {
       sync: normalizedPlan === "Family",
+      voiceSearch,
     },
+    restrictionNotice: buildRestrictionNotice(normalizedPlan, voiceSearch),
+    screenHelp: buildScreenHelp(),
   };
 }
 
