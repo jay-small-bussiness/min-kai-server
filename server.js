@@ -46,7 +46,7 @@ function evaluateVoiceSearch(plan, now) {
   const trialEndsAt = getVoiceTrialEndsAt(plan, now);
   const dailyLimit = DEFAULT_VOICE_DAILY_LIMIT;
   const trialActive = trialEndsAt ? now < new Date(trialEndsAt) : false;
-  const remainingToday = dailyLimit;
+  const remainingToday = trialActive ? dailyLimit : 0;
 
   return {
     trialActive,
