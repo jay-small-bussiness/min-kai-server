@@ -31,7 +31,7 @@ const pool = mysql.createPool({
 const VALID_PLANS = new Set(["Free", "Solo", "Family"]);
 let familyLookupColumn = null;
 const DEFAULT_VOICE_DAILY_LIMIT = 5;
-const HARDCODED_TRIAL_ENDS_AT = "2026-04-25T00:00:00Z";
+const HARDCODED_TRIAL_ENDS_AT = "2026-03-01T00:00:00Z";
 
 function getVoiceTrialEndsAt(plan, now) {
   if (plan !== "Free") {
