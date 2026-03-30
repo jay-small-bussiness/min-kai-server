@@ -88,8 +88,8 @@ function buildRestrictionNotice(plan, voiceSearch) {
 
   if (voiceSearch.restricted) {
     return {
-      title: "Voice search limit reached",
-      body: "Today's Free-plan voice-search limit has been reached.",
+      title: "本日のFreeプランの音声検索回数は上限に達しています",
+      body: "",
       campaignId: "voice-limit-reached",
       actions: [
         {
