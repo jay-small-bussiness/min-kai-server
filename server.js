@@ -33,6 +33,40 @@ let familyLookupColumn = null;
 const DEFAULT_VOICE_DAILY_LIMIT = 5;
 const HARDCODED_TRIAL_ENDS_AT = "2026-03-01T00:00:00Z";
 
+function getJstDayRangeUtc(now = new Date()) {
+  const jstOffsetMinutes = 9 * 60;
+  const jstNow = new Date(now.getTime() + jstOffsetMinutes * 60 * 1000);
+
+  const startOfJstDay = new Date(
+    Date.UTC(
+      jstNow.getUTCFullYear(),
+      jstNow.getUTCMonth(),
+      jstNow.getUTCDate(),
+      0,
+      0,
+      0,
+      0
+    )
+  );
+
+  const endOfJstDay = new Date(
+    Date.UTC(
+      jstNow.getUTCFullYear(),
+      jstNow.getUTCMonth(),
+      jstNow.getUTCDate() + 1,
+      0,
+      0,
+      0,
+      0
+    )
+  );
+
+  return {
+    startUtc: new Date(startOfJstDay.getTime() - jstOffsetMinutes * 60 * 1000),
+    endUtc: new Date(endOfJstDay.getTime() - jstOffsetMinutes * 60 * 1000),
+  };
+}
+
 function getVoiceTrialEndsAt(plan, now) {
   if (plan !== "Free") {
     return null;
@@ -42,11 +76,13 @@ function getVoiceTrialEndsAt(plan, now) {
   return HARDCODED_TRIAL_ENDS_AT;
 }
 
-function evaluateVoiceSearch(plan, now) {
+function evaluateVoiceSearch(plan, now, usedToday = 0) {
   const trialEndsAt = getVoiceTrialEndsAt(plan, now);
   const dailyLimit = DEFAULT_VOICE_DAILY_LIMIT;
   const trialActive = trialEndsAt ? now < new Date(trialEndsAt) : false;
-  const remainingToday = trialActive ? dailyLimit : 0;
+  const remainingToday = trialActive
+    ? dailyLimit
+    : Math.max(0, dailyLimit - usedToday);
 
   return {
     trialActive,
@@ -117,6 +153,26 @@ function buildScreenHelp() {
   return {};
 }
 
+async function countVoiceSearchUsageToday(userId, now = new Date()) {
+  if (!userId) {
+    return 0;
+  }
+
+  const { startUtc, endUtc } = getJstDayRangeUtc(now);
+  const [rows] = await pool.query(
+    `
+      SELECT COUNT(*) AS used_today
+      FROM voice_search_usage
+      WHERE user_id = ?
+        AND used_at >= ?
+        AND used_at < ?
+    `,
+    [userId, startUtc, endUtc]
+  );
+
+  return Number(rows[0]?.used_today ?? 0);
+}
+
 function normalizePlan(plan) {
   if (typeof plan !== "string") {
     return "Free";
@@ -126,10 +182,11 @@ function normalizePlan(plan) {
   return VALID_PLANS.has(trimmed) ? trimmed : "Free";
 }
 
-function buildPlanResponse(plan) {
+async function buildPlanResponse(plan, userId) {
   const normalizedPlan = normalizePlan(plan);
   const now = new Date();
-  const voiceSearch = evaluateVoiceSearch(normalizedPlan, now);
+  const usedToday = await countVoiceSearchUsageToday(userId, now);
+  const voiceSearch = evaluateVoiceSearch(normalizedPlan, now, usedToday);
 
   return {
     plan: normalizedPlan,
@@ -195,12 +252,26 @@ async function ensureAccountPlanSchema() {
   );
 }
 
+async function ensureVoiceSearchUsageSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS voice_search_usage (
+      id BIGINT NOT NULL AUTO_INCREMENT,
+      user_id VARCHAR(64) NOT NULL,
+      used_at DATETIME NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_voice_search_usage_user_used_at (user_id, used_at)
+    )
+  `);
+}
+
 app.get("/api/account/plan", async (req, res) => {
   const familyId = req.query.family_id ?? req.header("X-Family-ID");
+  const userId = req.query.user_id ?? req.header("X-User-ID");
 
   try {
     if (!familyId || !familyLookupColumn) {
-      return res.json(buildPlanResponse("Free"));
+      return res.json(await buildPlanResponse("Free", userId));
     }
 
     const [rows] = await pool.query(
@@ -209,10 +280,35 @@ app.get("/api/account/plan", async (req, res) => {
     );
 
     if (rows.length === 0) {
-      return res.json(buildPlanResponse("Free"));
+      return res.json(await buildPlanResponse("Free", userId));
     }
 
-    return res.json(buildPlanResponse(rows[0].plan));
+    return res.json(await buildPlanResponse(rows[0].plan, userId));
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/voice-search/usage", async (req, res) => {
+  const { user_id } = req.body;
+
+  if (!user_id) {
+    return res.status(400).json({ error: "user_id is required" });
+  }
+
+  try {
+    const usedAt = new Date();
+
+    await pool.query(
+      `
+        INSERT INTO voice_search_usage (user_id, used_at)
+        VALUES (?, ?)
+      `,
+      [user_id, usedAt]
+    );
+
+    return res.json({ status: "ok" });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: err.message });
@@ -422,6 +518,7 @@ const port = 3000;
 async function startServer() {
   try {
     await ensureAccountPlanSchema();
+    await ensureVoiceSearchUsageSchema();
     app.listen(port, () => console.log(`API running on port ${port}`));
   } catch (err) {
     console.error("Failed to start server:", err);
