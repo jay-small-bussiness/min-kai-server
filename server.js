@@ -1,13 +1,13 @@
-const express = require("express");
+﻿const express = require("express");
 const mysql = require("mysql2/promise");
 
 const app = express();
-app.use(express.json());  // ★ JSON読み取り有効化
+app.use(express.json());  // 笘・JSON隱ｭ縺ｿ蜿悶ｊ譛牙柑蛹・
 console.log("Deployment test");
 
 /*
-▼旧バージョン（pool 導入前）
-  必要あれば復活させるため残してある
+笆ｼ譌ｧ繝舌・繧ｸ繝ｧ繝ｳ・・ool 蟆主・蜑搾ｼ・
+  蠢・ｦ√≠繧後・蠕ｩ豢ｻ縺輔○繧九◆繧∵ｮ九＠縺ｦ縺ゅｋ
 async function getDB() {
   return mysql.createConnection({
     host: process.env.MYSQL_HOST,
@@ -18,7 +18,7 @@ async function getDB() {
   });
 }
 */
-// poolを使ったDBアクセスの準備
+// pool繧剃ｽｿ縺｣縺櫂B繧｢繧ｯ繧ｻ繧ｹ縺ｮ貅門ｙ
 const pool = mysql.createPool({
   host: process.env.MYSQL_HOST,
   port: process.env.MYSQL_PORT,
@@ -88,13 +88,13 @@ function buildRestrictionNotice(plan, voiceSearch) {
 
   if (voiceSearch.restricted) {
     return {
-      title: "音声検索の利用上限に達しました",
-      body: "本日の音声検索回数（5回）を使い切りました",
+      title: "本日のFreeプランの音声検索回数は上限に達しています",
+      body: "音声検索は本日分を使い切りました。\nカテゴリー一覧から商品を選んで追加できます。",
       campaignId: "voice-limit-reached",
       actions: [
         {
           type: "dismiss",
-          label: "OK",
+          label: "カテゴリー一覧を見る",
         },
       ],
     };
@@ -337,7 +337,7 @@ app.post('/checklist', async (req, res) => {
   const { family_id, item_name, is_checked, updated_by } = req.body;
 
   try {
-    // ① 重複チェック
+    // 竭 驥崎､・メ繧ｧ繝・け
     const [existRows] = await pool.query(
       `SELECT item_id FROM shared_checklist
        WHERE family_id = ? AND item_name = ? AND is_checked = 0`,
@@ -345,14 +345,14 @@ app.post('/checklist', async (req, res) => {
     );
 
     if (existRows.length > 0) {
-      // すでに未チェックで存在する → 新規追加せずそれを返す
+      // 縺吶〒縺ｫ譛ｪ繝√ぉ繝・け縺ｧ蟄伜惠縺吶ｋ 竊・譁ｰ隕剰ｿｽ蜉縺帙★縺昴ｌ繧定ｿ斐☆
       return res.json({
         status: "exists",
         item_id: existRows[0].item_id
       });
     }
 
-    // ② 新規追加
+    // 竭｡ 譁ｰ隕剰ｿｽ蜉
     const [result] = await pool.query(
       `INSERT INTO shared_checklist 
         (family_id, item_name, is_checked, updated_by, updated_at)
@@ -430,3 +430,4 @@ async function startServer() {
 }
 
 startServer();
+
