@@ -32,6 +32,8 @@ const VALID_PLANS = new Set(["Free", "Solo", "Family"]);
 let familyLookupColumn = null;
 const DEFAULT_VOICE_DAILY_LIMIT = 5;
 const HARDCODED_TRIAL_ENDS_AT = "2026-03-01T00:00:00Z";
+const UUID_PATTERN =
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
 function getJstDayRangeUtc(now = new Date()) {
   const jstOffsetMinutes = 9 * 60;
@@ -153,6 +155,23 @@ function buildScreenHelp() {
   return {};
 }
 
+function normalizeUserId(userId) {
+  if (userId === undefined || userId === null) {
+    return null;
+  }
+
+  if (typeof userId !== "string") {
+    return null;
+  }
+
+  const trimmed = userId.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  return UUID_PATTERN.test(trimmed) ? trimmed : null;
+}
+
 async function countVoiceSearchUsageToday(userId, now = new Date()) {
   if (!userId) {
     return 0;
@@ -256,18 +275,45 @@ async function ensureVoiceSearchUsageSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS voice_search_usage (
       id BIGINT NOT NULL AUTO_INCREMENT,
-      user_id VARCHAR(64) NOT NULL,
+      user_id VARCHAR(36) NOT NULL,
       used_at DATETIME NOT NULL,
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (id),
       KEY idx_voice_search_usage_user_used_at (user_id, used_at)
     )
   `);
+
+  const [columnRows] = await pool.query(
+    `SELECT COLUMN_TYPE
+       FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = ?
+        AND TABLE_NAME = 'voice_search_usage'
+        AND COLUMN_NAME = 'user_id'
+      LIMIT 1`,
+    [process.env.MYSQL_DATABASE]
+  );
+
+  if (columnRows.length === 0) {
+    throw new Error("voice_search_usage.user_id column is missing");
+  }
+
+  const columnType = String(columnRows[0].COLUMN_TYPE || "").toLowerCase();
+  if (columnType !== "varchar(36)") {
+    await pool.query(`
+      ALTER TABLE voice_search_usage
+      MODIFY COLUMN user_id VARCHAR(36) NOT NULL
+    `);
+  }
 }
 
 app.get("/api/account/plan", async (req, res) => {
   const familyId = req.query.family_id ?? req.header("X-Family-ID");
-  const userId = req.query.user_id ?? req.header("X-User-ID");
+  const rawUserId = req.query.user_id ?? req.header("X-User-ID");
+  const userId = normalizeUserId(rawUserId);
+
+  if (rawUserId !== undefined && rawUserId !== null && !userId) {
+    return res.status(400).json({ error: "user_id must be a UUID string" });
+  }
 
   try {
     if (!familyId || !familyLookupColumn) {
@@ -291,10 +337,12 @@ app.get("/api/account/plan", async (req, res) => {
 });
 
 app.post("/api/voice-search/usage", async (req, res) => {
-  const { user_id } = req.body;
+  const userId = normalizeUserId(req.body?.user_id);
 
-  if (!user_id) {
-    return res.status(400).json({ error: "user_id is required" });
+  if (!userId) {
+    return res
+      .status(400)
+      .json({ error: "user_id is required and must be a UUID string" });
   }
 
   try {
@@ -305,7 +353,7 @@ app.post("/api/voice-search/usage", async (req, res) => {
         INSERT INTO voice_search_usage (user_id, used_at)
         VALUES (?, ?)
       `,
-      [user_id, usedAt]
+      [userId, usedAt]
     );
 
     return res.json({ status: "ok" });
