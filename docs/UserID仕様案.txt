@@ -1,0 +1,395 @@
+ 結論
+  Ver1.0 の現実解としては、UserID = 端末上の利用主体識別子、Account = サー
+  バー上の契約主体、FamilyID = 将来の共有グループ識別子 に分ける整理が最も無
+  理が少ないです。
+  その前提なら、Ver1.0 では UserID は UUID + Preferences + QR移行 で進め、
+  voice_search_usage は user_id 単位、/api/account/plan は「現在有効な実効プ
+  ラン」を返す仕様に寄せるのが妥当です。
+
+  前提評価
+  ✅ 確実
+
+  - Ver1.0 では認証機構が未完成または未導入。
+  - Ver1.0 の音声検索回数制限は Free のみ対象。
+  - Solo / Family は現時点で音声検索回数制限なし。
+  - 課金情報はサーバー側で管理したい。
+  - Family は将来同期機能に使う想定。
+  - Ver1.0 では QR による旧端末→新端末のマスター移行を行う。
+
+  ⚠ 推測（仮説）
+
+  - 仮説: Ver1.0 では「1ユーザー=1端末継続利用」が主であり、複数端末同時利用
+    の厳密整合は後回しにできる。
+  - 根拠: 認証未導入、QR移行前提、課金責務だけ先にサーバーへ寄せたいという条
+    件。
+  - 検証方法: 想定ユーザーストーリーを 5 件程度書き、同時多端末利用が Ver1.0
+    要件か確認する。
+  - 外れた場合の次候補: Ver1.0 から account_users に複数 user_id を許容する
+    前提へ上げる。
+
+  ## 1. Ver1.0 時点での UserID の仕様案
+
+  ✅ 確実
+
+  - UserID は Ver1.0 で必要です。サーバー API が利用主体識別子を必要とするた
+    めです。
+  - 形式は UUID v4 相当のランダム識別子で十分です。
+  - 初回起動時にクライアントで生成し、.NET MAUI Preferences に保存し、以後は
+    同一端末で使い回す仕様が最小です。
+  - QR マスター移行データに user_id を含め、新端末で引き継ぐ仕様は整合しま
+    す。
+
+  ⚠ 推測（仮説）
+
+  - 仮説: Ver1.0 の識別子としては UUID + Preferences + QR移行 で十分。
+  - 根拠: 認証未導入でも、端末継続利用と機種変更移行を満たせる。サーバー側も
+    VARCHAR(36) か CHAR(36) で扱える。
+  - 検証方法: 旧端末→新端末移行後に /api/account/plan と利用制限判定が継続す
+    るかを E2E で確認する。
+  - 外れた場合の次候補: Preferences ではなく OS セキュアストレージへ保存し、
+    QR移行時のみ明示エクスポートする。
+
+  ❌ 不明
+
+  - QR移行時に「旧端末を無効化するか」「旧新端末併用を許すか」は未定義です。
+  - Preferences が端末初期化・再インストール時に消えた場合の再同定ルールは未
+    定義です。
+
+  推奨仕様
+
+  - user_id はクライアント生成 UUID。
+  - 永続化先は Preferences。
+  - 再インストール時は新規 user_id 扱い。
+  - 機種変更時のみ QR 移行で user_id を引き継ぐ。
+  - Ver1.0 では「同時多端末利用の厳密制御」は対象外。
+
+  ## 2. Ver1.0 時点で FamilyID を持つべきかどうか
+
+  推奨は「概念は定義するが、Ver1.0 では必須実装にしない」です。
+
+  ✅ 確実
+
+  - Free 制限判定には FamilyID は不要です。
+  - Solo 課金反映にも FamilyID は不要です。
+  - Ver1.0 の主要ユースケースは UserID と Account で成立します。
+
+  ⚠ 推測（仮説）
+
+  - 仮説: FamilyID は Ver1.0 では DB 主体に入れず、仕様書上の予約概念に留め
+    るのが最小。
+  - 根拠: Family の本体価値は共有・同期であり、今回整理対象は課金責務分離と
+    Free 制限。
+  - 検証方法: Ver1.0 の API 一覧に Family 関連 API が必要か棚卸しする。不要
+    なら先送りが妥当。
+  - 外れた場合の次候補: accounts.family_group_id NULL を先に置くだけ置いて、
+    運用では未使用にする。
+
+  ❌ 不明
+
+  - Family プランを Ver1.0 で実販売するか。
+  - Family 内の「親アカウント」「参加ユーザー」モデルを Ver1.0 で持つか。
+
+  結論
+
+  - Ver1.0 実装: FamilyID は不要寄り。
+  - Ver1.0 仕様書: 「将来、共有同期単位として導入予定」とだけ定義。
+
+  ## 3. UserID / FamilyID / Account の役割分担
+
+  最小責務分離案
+
+  - UserID: 利用主体識別子。クライアントが保持し、API 呼び出し時に送る。
+  - Account: 契約主体。サーバーが保持し、課金状態・実効プラン判定の基点。
+  - FamilyID: 共有グループ識別子。将来の共有同期単位。
+
+  ✅ 確実
+
+  - 課金状態を user_id に直接持たせるより、Account に寄せた方が再紐付けに強
+    いです。
+  - FamilyID と Account は役割が違います。
+  - FamilyID は「共有データの単位」、Account は「契約状態の単位」です。
+
+  ⚠ 推測（仮説）
+
+  - 仮説: Ver1.0 では 1 Account : 1 active UserID を基本にしつつ、将来 1
+    Account : n UserIDs に拡張できる形がよい。
+  - 根拠: QR移行で旧新 user_id が発生しうる。課金主体を Account に切ると再紐
+    付けしやすい。
+  - 検証方法: 機種変更時の旧 user_id と新 user_id の扱いを運用フローで確認す
+    る。
+  - 外れた場合の次候補: Ver1.0 は accounts.current_user_id の単純設計にし
+    て、将来 account_users へ移行する。
+
+  ## 4. Solo 課金状態をサーバーが認識する最小フロー
+
+  推奨フロー
+
+  1. 初回起動でクライアントが user_id を生成。
+  2. クライアントは /api/account/resolve 相当で user_id に対応する account
+     を確保。
+  3. 通常時 /api/account/plan?user_id=... で実効プラン取得。
+  4. 購入成立後、クライアントが purchase_token/receipt + store + product_id
+     + user_id をサーバーへ送る。
+  5. サーバーが外部ストア検証を行う。
+  6. 検証成功時、該当 account を Solo 有効状態へ更新。
+  7. 以後 /api/account/plan は Solo を返す。
+
+  ✅ 確実
+
+  - 「クライアントが購入情報 + UserID をサーバーへ送る」起点で十分に最小フ
+    ローを組めます。
+  - ただし最終判定はサーバーで行うべきです。クライアントの自己申告だけで
+    Solo にしてはいけません。
+
+  ⚠ 推測（仮説）
+
+  - 仮説: Ver1.0 は webhook 完備でなくても、purchase sync API と plan API だ
+    けで成立する。
+  - 根拠: 今回の対象は Billing API 詳細ではなく、責務分離と最小構造。
+  - 検証方法: 解約・期限切れ反映が「次回アプリ起動時/購入画面復元時」に間に
+    合うか確認する。
+  - 外れた場合の次候補: ストア webhook / RTDN を追加し、サーバー側で非同期反
+    映する。
+
+  API責務の最小案
+
+  - POST /api/account/resolve
+      - 入力: user_id
+      - 役割: user_id に対応する account を作成または取得
+  - GET /api/account/plan
+      - 入力: user_id
+      - 役割: 現在有効な実効プランを返す
+  - POST /api/billing/purchases/sync
+      - 入力: user_id, store, product_id, purchase_token
+      - 役割: 購入検証し、account 状態を更新
+
+  ## 5. Solo → Free を扱うための最小状態管理
+
+  結論: Account に plan_type だけでは不足し、少なくとも status と
+  current_period_expires_at は持つべきです。
+
+  ✅ 確実
+
+  - /api/account/plan は「一度でも Solo だったか」ではなく「現在有効な実効プ
+    ラン」を返すべきです。
+  - そのため plan_type だけでは不足します。
+
+  最小状態
+
+  - plan_type: free | solo | family
+  - status: active | cancel_scheduled | expired
+  - current_period_expires_at: 現在有効期限
+  - cancel_at_period_end: 解約予約フラグ
+
+  ⚠ 推測（仮説）
+
+  - 仮説: Ver1.0 では status + current_period_expires_at +
+    cancel_at_period_end で十分。
+  - 根拠: Solo 継続、解約予約、期限切れ→Free の判定に必要十分。
+  - 検証方法: 4 状態 Free → Solo → cancel_scheduled → expired/free を時系列
+    テストで検証する。
+  - 外れた場合の次候補: subscriptions 履歴テーブルを別建てし、accounts には
+    キャッシュ結果だけ持つ。
+
+  実効プラン判定ルール
+
+  - plan_type = solo かつ status in ('active','cancel_scheduled') かつ
+    expires_at > now → Solo
+  - 上記以外 → Free
+  - Family 導入後は同様に Family
+
+  ## 6. voice_search_usage テーブルの最小構成
+
+  結論: Ver1.0 は user_id 単位で十分です。family_id は不要です。
+
+  ✅ 確実
+
+  - Free 制限対象は利用主体単位であり、現時点では FamilyID を使う要件があり
+    ません。
+  - Solo / Family は現時点で無制限なので、制限ログ集計は Free 判定時だけ見れ
+    ば足ります。
+
+  ⚠ 推測（仮説）
+
+  - 仮説: Ver1.0 の voice_search_usage は user_id, used_at だけで十分。
+  - 根拠: 実効プランは別途 account で判定し、Free の時だけカウントすればよ
+    い。
+  - 検証方法: /api/account/plan の結果を先に見て、Free のときだけ当日件数集
+    計する設計で API 実装を通してみる。
+  - 外れた場合の次候補: account_id を併記する。ただし Ver1.0 では過剰寄り。
+
+  推奨SQL
+
+  CREATE TABLE voice_search_usage (
+      id BIGINT NOT NULL AUTO_INCREMENT,
+      user_id CHAR(36) NOT NULL,
+      used_at DATETIME NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_voice_search_usage_user_used_at (user_id, used_at)
+  );
+
+  ## 7. MySQL テーブル設計の最小案
+
+  推奨は 3 テーブルです。
+
+  ### 7-1. accounts
+
+  CREATE TABLE accounts (
+      id BIGINT NOT NULL AUTO_INCREMENT,
+      account_uuid CHAR(36) NOT NULL,
+      plan_type ENUM('free', 'solo', 'family') NOT NULL DEFAULT 'free',
+      status ENUM('active', 'cancel_scheduled', 'expired') NOT NULL DEFAULT
+  'active',
+      current_period_expires_at DATETIME NULL,
+      cancel_at_period_end TINYINT(1) NOT NULL DEFAULT 0,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE
+  CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uk_accounts_account_uuid (account_uuid)
+  );
+
+  ### 7-2. account_users
+
+  CREATE TABLE account_users (
+      id BIGINT NOT NULL AUTO_INCREMENT,
+      account_id BIGINT NOT NULL,
+      user_id CHAR(36) NOT NULL,
+      is_primary TINYINT(1) NOT NULL DEFAULT 1,
+      linked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      unlinked_at DATETIME NULL,
+      PRIMARY KEY (id),
+      UNIQUE KEY uk_account_users_user_id_active (user_id, unlinked_at),
+      KEY idx_account_users_account_id (account_id),
+      CONSTRAINT fk_account_users_account
+          FOREIGN KEY (account_id) REFERENCES accounts(id)
+  );
+
+  ### 7-3. billing_purchases
+
+  CREATE TABLE billing_purchases (
+      id BIGINT NOT NULL AUTO_INCREMENT,
+      account_id BIGINT NOT NULL,
+      store ENUM('google_play', 'apple_app_store') NOT NULL,
+      product_id VARCHAR(128) NOT NULL,
+      purchase_token VARCHAR(255) NOT NULL,
+      purchase_state ENUM('purchased', 'canceled', 'expired') NOT NULL,
+      purchased_at DATETIME NULL,
+      expires_at DATETIME NULL,
+      raw_payload_json JSON NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE
+  CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uk_billing_purchases_store_token (store, purchase_token),
+      KEY idx_billing_purchases_account_id (account_id),
+      CONSTRAINT fk_billing_purchases_account
+          FOREIGN KEY (account_id) REFERENCES accounts(id)
+  );
+
+  ### 7-4. voice_search_usage
+
+  CREATE TABLE voice_search_usage (
+      id BIGINT NOT NULL AUTO_INCREMENT,
+      user_id CHAR(36) NOT NULL,
+      used_at DATETIME NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_voice_search_usage_user_used_at (user_id, used_at)
+  );
+
+  簡略版に落とすなら
+
+  - Ver1.0 本当に最小なら accounts と account_users と voice_search_usage の
+    3 つ。
+  - billing_purchases は監査用途としてできれば欲しいが、最小最小なら後回し可
+    能。
+
+  ## 8. Ver1.0 で決めておくべきこと
+
+  ✅ 確実
+
+  - user_id の生成方式: UUID v4。
+  - user_id の保存場所: Preferences。
+  - QR移行時に user_id を引き継ぐこと。
+  - /api/account/plan は実効プランを返すこと。
+  - 音声検索制限ログは user_id 単位にすること。
+  - Solo 課金状態は Account に持つこと。
+  - user_id と account の紐付け解決方法。
+  - 期限切れ時は Free へ戻る判定ルール。
+
+  ⚠ 推測（仮説）
+
+  - 仮説: Ver1.0 では account_users を用意しておくと後の移行が楽。
+  - 根拠: QR移行や再紐付けを accounts.current_user_id 直持ちより扱いやすい。
+  - 検証方法: 「旧 user_id を無効化し、新 user_id を有効化する」操作を DB で
+    試す。
+  - 外れた場合の次候補: Ver1.0 は accounts.current_user_id に落とし、Ver1.1
+    で account_users へ昇格。
+
+  ## 9. 逆に Ver1.0 では決めすぎない方がよいこと
+
+  ✅ 確実
+
+  - Family の参加招待フロー。
+  - Family 内権限モデル。
+  - 複数ストア横断の完全な購買抽象化。
+  - 認証後の本人確認統合仕様。
+  - 多端末同時利用制御。
+
+  ⚠ 推測（仮説）
+
+  - 仮説: FamilyID を今から広く埋め込むと、Ver1.0 の Free/Solo 整理を不必要
+    に複雑化する。
+  - 根拠: 現在の主要論点は共有ではなく、識別子責務分離と課金反映。
+  - 検証方法: API/DB から family_id を外した設計で Ver1.0 ユースケースが全部
+    通るか確認する。
+  - 外れた場合の次候補: accounts に family_group_id NULL だけ予約追加する。
+
+  ## 10. 仕様書へ追記する短い文案
+
+  短文案 1
+
+  > Ver1.0 では、アプリ初回起動時にクライアントが UserID(UUID) を生成し、端
+  > 末内に保存する。UserID は API 利用主体識別子として使用し、機種変更時は
+  > QR マスター移行により新端末へ引き継ぐ。
+
+  短文案 2
+
+  > Ver1.0 では、課金状態は UserID ではなくサーバー側 Account に保持する。/
+  > api/account/plan は UserID に紐づく Account を解決し、現在有効な実効プラ
+  > ンを返す。
+
+  短文案 3
+
+  > Ver1.0 の音声検索回数制限は Free プランのみを対象とし、利用記録は
+  > voice_search_usage テーブルで user_id 単位に管理する。Solo / Family は現
+  > 時点では回数制限対象外とする。
+
+  短文案 4
+
+  > FamilyID は将来の共有同期単位として定義するが、Ver1.0 では必須実装としな
+  > い。Ver1.0 の課金判定と音声検索制限は UserID および Account を基準に行
+  > う。
+
+  設計判断の要約
+
+  - UserID は UUID + Preferences + QR移行で十分か
+      - ✅ 確実: Ver1.0 の最小識別子としては十分寄り。
+  - FamilyID は Ver1.0 では設計概念だけでよいか
+      - ⚠ 推測: 実装先送りが妥当。
+  - voice_search_usage は user_id 単位で十分か
+      - ✅ 確実: 現前提では十分。
+  - 課金状態は user_id ではなく Account に持たせる設計が妥当か
+      - ✅ 確実: 妥当。
+  - 購入後にクライアントが購入情報 + UserID をサーバーへ送る方式でよいか
+      - ✅ 確実: 最小フローとして妥当。ただし最終検証はサーバー必須。
+  - Solo 解約・期限切れを考えると Account に status / expires_at を持たせる
+    べきか
+      - ✅ 確実: 持たせるべき。
+  - /api/account/plan は現在有効な実効プランを返すべきか
+      - ✅ 確実: 返すべき。
+
+  必要なら次に、この内容をそのまま [仕様書追記用Markdown] の形に整形して返し
+  ます。
