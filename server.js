@@ -29,7 +29,6 @@ const pool = mysql.createPool({
   connectionLimit: 10,
 });
 const VALID_PLANS = new Set(["Free", "Solo", "Family"]);
-let familyLookupColumn = null;
 const DEFAULT_VOICE_DAILY_LIMIT = 5;
 const HARDCODED_TRIAL_ENDS_AT = "2026-03-01T00:00:00Z";
 const UUID_PATTERN =
@@ -219,56 +218,208 @@ async function buildPlanResponse(plan, userId) {
 }
 
 async function ensureAccountPlanSchema() {
-  const [tableRows] = await pool.query(
-    `SELECT 1
-       FROM INFORMATION_SCHEMA.TABLES
-      WHERE TABLE_SCHEMA = ?
-        AND TABLE_NAME = 'family'
-      LIMIT 1`,
-    [process.env.MYSQL_DATABASE]
-  );
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS accounts (
+      id BIGINT NOT NULL AUTO_INCREMENT,
+      plan_type VARCHAR(10) NOT NULL DEFAULT 'Free',
+      status VARCHAR(20) NOT NULL DEFAULT 'active',
+      expires_at DATETIME NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id)
+    )
+  `);
 
-  if (tableRows.length === 0) {
-    return;
-  }
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS account_users (
+      id BIGINT NOT NULL AUTO_INCREMENT,
+      account_id BIGINT NOT NULL,
+      user_id VARCHAR(36) NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_account_users_user_id (user_id),
+      KEY idx_account_users_account_id (account_id)
+    )
+  `);
 
-  const [columnRows] = await pool.query(
-    `SELECT 1
+  const [accountPlanTypeRows] = await pool.query(
+    `SELECT COLUMN_TYPE
        FROM INFORMATION_SCHEMA.COLUMNS
       WHERE TABLE_SCHEMA = ?
-        AND TABLE_NAME = 'family'
-        AND COLUMN_NAME = 'plan'
+        AND TABLE_NAME = 'accounts'
+        AND COLUMN_NAME = 'plan_type'
       LIMIT 1`,
     [process.env.MYSQL_DATABASE]
   );
 
-  if (columnRows.length === 0) {
-    await pool.query(
-      "ALTER TABLE family ADD COLUMN plan VARCHAR(10) NOT NULL DEFAULT 'Family'"
+  if (accountPlanTypeRows.length === 0) {
+    throw new Error("accounts.plan_type column is missing");
+  }
+
+  const accountPlanType = String(
+    accountPlanTypeRows[0].COLUMN_TYPE || ""
+  ).toLowerCase();
+  if (accountPlanType !== "varchar(10)") {
+    await pool.query(`
+      ALTER TABLE accounts
+      MODIFY COLUMN plan_type VARCHAR(10) NOT NULL DEFAULT 'Free'
+    `);
+  }
+
+  const [accountUsersRows] = await pool.query(
+    `SELECT COLUMN_TYPE
+       FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = ?
+        AND TABLE_NAME = 'account_users'
+        AND COLUMN_NAME = 'user_id'
+      LIMIT 1`,
+    [process.env.MYSQL_DATABASE]
+  );
+
+  if (accountUsersRows.length === 0) {
+    throw new Error("account_users.user_id column is missing");
+  }
+
+  const accountUsersType = String(
+    accountUsersRows[0].COLUMN_TYPE || ""
+  ).toLowerCase();
+  if (accountUsersType !== "varchar(36)") {
+    await pool.query(`
+      ALTER TABLE account_users
+      MODIFY COLUMN user_id VARCHAR(36) NOT NULL
+    `);
+  }
+
+  await pool.query(`
+    UPDATE accounts
+       SET plan_type = 'Free'
+     WHERE plan_type IS NULL
+        OR TRIM(plan_type) = ''
+        OR plan_type NOT IN ('Free', 'Solo', 'Family')
+  `);
+}
+
+function resolveEffectivePlan(account) {
+  if (!account) {
+    return "Free";
+  }
+
+  const normalizedPlan = normalizePlan(account.plan_type);
+  const normalizedStatus = String(account.status || "")
+    .trim()
+    .toLowerCase();
+
+  if (normalizedStatus && normalizedStatus !== "active") {
+    return "Free";
+  }
+
+  if (account.expires_at) {
+    const expiresAt = new Date(account.expires_at);
+    if (!Number.isNaN(expiresAt.getTime()) && expiresAt <= new Date()) {
+      return "Free";
+    }
+  }
+
+  return normalizedPlan;
+}
+
+async function findOrCreateAccountByUserId(userId) {
+  const [rows] = await pool.query(
+    `
+      SELECT
+        au.account_id,
+        a.plan_type,
+        a.status,
+        a.expires_at
+      FROM account_users au
+      INNER JOIN accounts a ON a.id = au.account_id
+      WHERE au.user_id = ?
+      LIMIT 1
+    `,
+    [userId]
+  );
+
+  if (rows.length > 0) {
+    return rows[0];
+  }
+
+  const connection = await pool.getConnection();
+
+  try {
+    await connection.beginTransaction();
+
+    const [existingRows] = await connection.query(
+      `
+        SELECT
+          au.account_id,
+          a.plan_type,
+          a.status,
+          a.expires_at
+        FROM account_users au
+        INNER JOIN accounts a ON a.id = au.account_id
+        WHERE au.user_id = ?
+        LIMIT 1
+      `,
+      [userId]
     );
+
+    if (existingRows.length > 0) {
+      await connection.commit();
+      return existingRows[0];
+    }
+
+    const [accountResult] = await connection.query(
+      `
+        INSERT INTO accounts (plan_type, status, expires_at)
+        VALUES ('Free', 'active', NULL)
+      `
+    );
+
+    await connection.query(
+      `
+        INSERT INTO account_users (account_id, user_id)
+        VALUES (?, ?)
+      `,
+      [accountResult.insertId, userId]
+    );
+
+    await connection.commit();
+
+    return {
+      account_id: accountResult.insertId,
+      plan_type: "Free",
+      status: "active",
+      expires_at: null,
+    };
+  } catch (err) {
+    await connection.rollback();
+
+    if (err && err.code === "ER_DUP_ENTRY") {
+      const [retryRows] = await pool.query(
+        `
+          SELECT
+            au.account_id,
+            a.plan_type,
+            a.status,
+            a.expires_at
+          FROM account_users au
+          INNER JOIN accounts a ON a.id = au.account_id
+          WHERE au.user_id = ?
+          LIMIT 1
+        `,
+        [userId]
+      );
+
+      if (retryRows.length > 0) {
+        return retryRows[0];
+      }
+    }
+
+    throw err;
+  } finally {
+    connection.release();
   }
-
-  const [lookupColumnRows] = await pool.query(
-    `SELECT COLUMN_NAME
-       FROM INFORMATION_SCHEMA.COLUMNS
-      WHERE TABLE_SCHEMA = ?
-        AND TABLE_NAME = 'family'
-        AND COLUMN_NAME IN ('id', 'family_id')`,
-    [process.env.MYSQL_DATABASE]
-  );
-
-  familyLookupColumn =
-    lookupColumnRows.find((row) => row.COLUMN_NAME === "id")?.COLUMN_NAME ??
-    lookupColumnRows.find((row) => row.COLUMN_NAME === "family_id")?.COLUMN_NAME ??
-    null;
-
-  await pool.query(
-    `UPDATE family
-        SET plan = 'Family'
-      WHERE plan IS NULL
-         OR TRIM(plan) = ''
-         OR plan NOT IN ('Free', 'Solo', 'Family')`
-  );
 }
 
 async function ensureVoiceSearchUsageSchema() {
@@ -307,7 +458,6 @@ async function ensureVoiceSearchUsageSchema() {
 }
 
 app.get("/api/account/plan", async (req, res) => {
-  const familyId = req.query.family_id ?? req.header("X-Family-ID");
   const rawUserId = req.query.user_id ?? req.header("X-User-ID");
   const userId = normalizeUserId(rawUserId);
 
@@ -316,20 +466,13 @@ app.get("/api/account/plan", async (req, res) => {
   }
 
   try {
-    if (!familyId || !familyLookupColumn) {
-      return res.json(await buildPlanResponse("Free", userId));
+    if (!userId) {
+      return res.json(await buildPlanResponse("Free", null));
     }
 
-    const [rows] = await pool.query(
-      `SELECT plan FROM family WHERE ${familyLookupColumn} = ? LIMIT 1`,
-      [familyId]
-    );
-
-    if (rows.length === 0) {
-      return res.json(await buildPlanResponse("Free", userId));
-    }
-
-    return res.json(await buildPlanResponse(rows[0].plan, userId));
+    const account = await findOrCreateAccountByUserId(userId);
+    const effectivePlan = resolveEffectivePlan(account);
+    return res.json(await buildPlanResponse(effectivePlan, userId));
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: err.message });
