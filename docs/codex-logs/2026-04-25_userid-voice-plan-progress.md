@@ -187,6 +187,7 @@ Free 状態で `0/5` に到達したあと、
 - P0-2: 完了
 - P0-3: 実装・実機確認まで完了
 - P1-1: 実装・実機確認まで完了
+- restriction notice / help metadata safety rule: 完了
 - P0-4 以降: 未着手
 
 ---

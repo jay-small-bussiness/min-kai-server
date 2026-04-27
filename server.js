@@ -19,7 +19,7 @@ const pool = mysql.createPool({
 const VALID_PLANS = new Set(["Free", "Solo", "Family"]);
 const ACCOUNT_STATUSES = new Set(["active", "cancel_scheduled", "expired"]);
 const DEFAULT_VOICE_DAILY_LIMIT = 5;
-const HARDCODED_TRIAL_ENDS_AT = "2026-03-01T00:00:00Z";
+const TRIAL_PERIOD_DAYS = 30;
 const UUID_PATTERN =
   /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
@@ -57,18 +57,20 @@ function getJstDayRangeUtc(now = new Date()) {
   };
 }
 
-function getVoiceTrialEndsAt(plan, now) {
+function getVoiceTrialEndsAt(plan, account) {
   if (plan !== "Free") {
     return null;
   }
 
-  return HARDCODED_TRIAL_ENDS_AT;
+  return account?.expires_at ?? null;
 }
 
-function evaluateVoiceSearch(plan, now, usedToday = 0) {
-  const trialEndsAt = getVoiceTrialEndsAt(plan, now);
+function evaluateVoiceSearch(plan, now, usedToday = 0, account = null) {
+  const trialEndsAt = getVoiceTrialEndsAt(plan, account);
   const dailyLimit = DEFAULT_VOICE_DAILY_LIMIT;
-  const trialActive = trialEndsAt ? now < new Date(trialEndsAt) : false;
+  const trialEndDate = trialEndsAt ? new Date(trialEndsAt) : null;
+  const trialActive =
+    trialEndDate && !Number.isNaN(trialEndDate.getTime()) ? now < trialEndDate : false;
   const remainingToday = trialActive
     ? dailyLimit
     : Math.max(0, dailyLimit - usedToday);
@@ -206,11 +208,11 @@ async function countVoiceSearchUsageToday(userId, now = new Date()) {
   return Number(rows[0]?.used_today ?? 0);
 }
 
-async function buildPlanResponse(plan, userId) {
+async function buildPlanResponse(plan, userId, account = null) {
   const normalizedPlan = normalizePlan(plan);
   const now = new Date();
   const usedToday = await countVoiceSearchUsageToday(userId, now);
-  const voiceSearch = evaluateVoiceSearch(normalizedPlan, now, usedToday);
+  const voiceSearch = evaluateVoiceSearch(normalizedPlan, now, usedToday, account);
 
   return {
     plan: normalizedPlan,
@@ -498,9 +500,9 @@ async function findOrCreateAccountByUserId(userId) {
     const [accountResult] = await connection.query(
       `
         INSERT INTO accounts (account_uuid, plan_type, status, expires_at)
-        VALUES (?, 'free', 'active', NULL)
+        VALUES (?, 'free', 'active', DATE_ADD(CURRENT_TIMESTAMP, INTERVAL ? DAY))
       `,
-      [accountUuid]
+      [accountUuid, TRIAL_PERIOD_DAYS]
     );
 
     await connection.query(
@@ -518,7 +520,7 @@ async function findOrCreateAccountByUserId(userId) {
       account_uuid: accountUuid,
       plan_type: "free",
       status: "active",
-      expires_at: null,
+      expires_at: new Date(Date.now() + TRIAL_PERIOD_DAYS * 24 * 60 * 60 * 1000),
     };
   } catch (err) {
     await connection.rollback();
@@ -593,7 +595,7 @@ app.get("/api/account/plan", async (req, res) => {
 
     const account = await findOrCreateAccountByUserId(userId);
     const effectivePlan = resolveEffectivePlan(account);
-    return res.json(await buildPlanResponse(effectivePlan, userId));
+    return res.json(await buildPlanResponse(effectivePlan, userId, account));
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: err.message });

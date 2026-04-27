@@ -95,6 +95,8 @@
 
 ### 6. server に Ver1.0 の `Account` / `account_users` / `voice_search_usage` を実装する
 
+状態: 完了
+
 - `accounts` テーブルを追加する
 - `account_users` テーブルを追加し、`user_id` に `UNIQUE` 制約を付ける
 - `voice_search_usage` を Ver1.0 仕様どおり `user_id` ベースで定義する
@@ -108,6 +110,8 @@
 - DB migration スクリプト新規
 
 ### 7. `/api/account/plan` の response 契約を client 実装と揃える
+
+状態: 完了
 
 - `plan` を実効プランとして返す
 - `features.voiceSearch` の `trialActive`, `trialEndsAt`, `dailyLimit`, `remainingToday`, `restricted` を正式化する
@@ -123,6 +127,8 @@
 - `server/server.js`
 
 ### 8. restriction notice / help metadata の安全ルールを決める
+
+状態: 完了
 
 - `navigate` action の allowlist を定義する
 - 未知 action や未知 route の safe default を定義する
