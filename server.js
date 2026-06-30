@@ -1,4 +1,4 @@
-const { randomUUID } = require("crypto");
+const { createHash, createSign, randomUUID } = require("crypto");
 const express = require("express");
 const mysql = require("mysql2/promise");
 
@@ -20,8 +20,17 @@ const VALID_PLANS = new Set(["Free", "Solo", "Family"]);
 const ACCOUNT_STATUSES = new Set(["active", "cancel_scheduled", "expired"]);
 const DEFAULT_VOICE_DAILY_LIMIT = 5;
 const TRIAL_PERIOD_DAYS = 30;
+const GOOGLE_PLAY_STORE = "google_play";
+const SOLO_PRODUCT_ID = "min_kai_solo_monthly";
+const SOLO_BASE_PLAN_ID = "monthly-auto";
+const GOOGLE_PLAY_SCOPE = "https://www.googleapis.com/auth/androidpublisher";
+const GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token";
+const GOOGLE_PLAY_ANDROID_PUBLISHER_URL =
+  "https://androidpublisher.googleapis.com/androidpublisher/v3";
 const UUID_PATTERN =
   /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+let googleAccessTokenCache = null;
 
 function getJstDayRangeUtc(now = new Date()) {
   const jstOffsetMinutes = 9 * 60;
@@ -186,6 +195,188 @@ function normalizeAccountStatus(status) {
 
   const trimmed = status.trim().toLowerCase();
   return ACCOUNT_STATUSES.has(trimmed) ? trimmed : "active";
+}
+
+function normalizeRequiredString(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+function normalizeStore(store) {
+  const normalized = normalizeRequiredString(store);
+  return normalized ? normalized.toLowerCase() : null;
+}
+
+function getGooglePlayCredentials() {
+  if (process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON) {
+    const credentials = JSON.parse(process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON);
+    return {
+      clientEmail: credentials.client_email,
+      privateKey: credentials.private_key,
+    };
+  }
+
+  return {
+    clientEmail: process.env.GOOGLE_PLAY_CLIENT_EMAIL,
+    privateKey: process.env.GOOGLE_PLAY_PRIVATE_KEY,
+  };
+}
+
+function base64UrlEncode(value) {
+  return Buffer.from(value)
+    .toString("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+}
+
+function signGoogleJwt(credentials, nowSeconds) {
+  const privateKey = credentials.privateKey?.replace(/\\n/g, "\n");
+  if (!credentials.clientEmail || !privateKey) {
+    throw new Error("Google Play service account credentials are not configured");
+  }
+
+  const header = { alg: "RS256", typ: "JWT" };
+  const claimSet = {
+    iss: credentials.clientEmail,
+    scope: GOOGLE_PLAY_SCOPE,
+    aud: GOOGLE_OAUTH_TOKEN_URL,
+    exp: nowSeconds + 3600,
+    iat: nowSeconds,
+  };
+
+  const unsignedJwt = `${base64UrlEncode(JSON.stringify(header))}.${base64UrlEncode(
+    JSON.stringify(claimSet)
+  )}`;
+  const signer = createSign("RSA-SHA256");
+  signer.update(unsignedJwt);
+  signer.end();
+  const signature = signer
+    .sign(privateKey, "base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+
+  return `${unsignedJwt}.${signature}`;
+}
+
+async function getGooglePlayAccessToken() {
+  const now = Math.floor(Date.now() / 1000);
+  if (
+    googleAccessTokenCache &&
+    googleAccessTokenCache.expiresAtSeconds - 60 > now
+  ) {
+    return googleAccessTokenCache.accessToken;
+  }
+
+  const jwt = signGoogleJwt(getGooglePlayCredentials(), now);
+  const response = await fetch(GOOGLE_OAUTH_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion: jwt,
+    }),
+  });
+
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      `Google OAuth token request failed: ${response.status} ${JSON.stringify(body)}`
+    );
+  }
+
+  googleAccessTokenCache = {
+    accessToken: body.access_token,
+    expiresAtSeconds: now + Number(body.expires_in || 3600),
+  };
+
+  return googleAccessTokenCache.accessToken;
+}
+
+async function getGooglePlaySubscription(purchaseToken) {
+  const packageName = normalizeRequiredString(process.env.GOOGLE_PLAY_PACKAGE_NAME);
+  if (!packageName) {
+    throw new Error("GOOGLE_PLAY_PACKAGE_NAME is not configured");
+  }
+
+  const accessToken = await getGooglePlayAccessToken();
+  const url =
+    `${GOOGLE_PLAY_ANDROID_PUBLISHER_URL}/applications/` +
+    `${encodeURIComponent(packageName)}/purchases/subscriptionsv2/tokens/` +
+    encodeURIComponent(purchaseToken);
+
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      `Google Play subscription verification failed: ${response.status} ${JSON.stringify(body)}`
+    );
+  }
+
+  return body;
+}
+
+function getMatchingSoloLineItem(subscription) {
+  const lineItems = Array.isArray(subscription?.lineItems)
+    ? subscription.lineItems
+    : [];
+
+  return lineItems.find((lineItem) => {
+    const basePlanId = lineItem?.offerDetails?.basePlanId;
+    return (
+      lineItem?.productId === SOLO_PRODUCT_ID && basePlanId === SOLO_BASE_PLAN_ID
+    );
+  });
+}
+
+function resolveSoloStatusFromGooglePlay(subscription) {
+  const lineItem = getMatchingSoloLineItem(subscription);
+  if (!lineItem) {
+    return {
+      matchesSoloProduct: false,
+      planType: "free",
+      status: "expired",
+      expiresAt: null,
+    };
+  }
+
+  const expiresAt = lineItem.expiryTime ? new Date(lineItem.expiryTime) : null;
+  const expiresInFuture =
+    expiresAt && !Number.isNaN(expiresAt.getTime()) && expiresAt > new Date();
+  const subscriptionState = subscription?.subscriptionState;
+  const usableState = [
+    "SUBSCRIPTION_STATE_ACTIVE",
+    "SUBSCRIPTION_STATE_IN_GRACE_PERIOD",
+  ].includes(subscriptionState);
+
+  if (!expiresInFuture || !usableState) {
+    return {
+      matchesSoloProduct: true,
+      planType: "free",
+      status: "expired",
+      expiresAt,
+    };
+  }
+
+  const autoRenewEnabled = lineItem?.autoRenewingPlan?.autoRenewEnabled;
+  return {
+    matchesSoloProduct: true,
+    planType: "solo",
+    status: autoRenewEnabled === false ? "cancel_scheduled" : "active",
+    expiresAt,
+  };
+}
+
+function hashPurchaseToken(purchaseToken) {
+  return createHash("sha256").update(purchaseToken).digest("hex");
 }
 
 async function countVoiceSearchUsageToday(userId, now = new Date()) {
@@ -538,6 +729,124 @@ async function findOrCreateAccountByUserId(userId) {
   }
 }
 
+async function syncGooglePlaySoloPurchase({
+  userId,
+  productId,
+  basePlanId,
+  purchaseToken,
+}) {
+  if (productId !== SOLO_PRODUCT_ID) {
+    const err = new Error(`product_id must be ${SOLO_PRODUCT_ID}`);
+    err.statusCode = 400;
+    throw err;
+  }
+
+  if (basePlanId && basePlanId !== SOLO_BASE_PLAN_ID) {
+    const err = new Error(`base_plan_id must be ${SOLO_BASE_PLAN_ID}`);
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const account = await findOrCreateAccountByUserId(userId);
+  const subscription = await getGooglePlaySubscription(purchaseToken);
+  const verifiedSolo = resolveSoloStatusFromGooglePlay(subscription);
+
+  if (!verifiedSolo.matchesSoloProduct) {
+    const err = new Error("purchase token does not match the Solo monthly product");
+    err.statusCode = 409;
+    throw err;
+  }
+
+  const connection = await pool.getConnection();
+  const purchaseTokenHash = hashPurchaseToken(purchaseToken);
+  const purchaseTokenLast4 = purchaseToken.slice(-4);
+  const expiresAt = verifiedSolo.expiresAt;
+
+  try {
+    await connection.beginTransaction();
+
+    await connection.query(
+      `
+        UPDATE accounts
+           SET plan_type = ?,
+               status = ?,
+               expires_at = ?
+         WHERE id = ?
+      `,
+      [
+        verifiedSolo.planType,
+        verifiedSolo.status,
+        expiresAt,
+        account.account_id,
+      ]
+    );
+
+    await connection.query(
+      `
+        INSERT INTO billing_purchases (
+          account_id,
+          user_id,
+          store,
+          product_id,
+          base_plan_id,
+          purchase_token_hash,
+          purchase_token_last4,
+          subscription_state,
+          account_plan_type,
+          account_status,
+          expires_at,
+          verified_at,
+          raw_response
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+        ON DUPLICATE KEY UPDATE
+          account_id = VALUES(account_id),
+          user_id = VALUES(user_id),
+          store = VALUES(store),
+          product_id = VALUES(product_id),
+          base_plan_id = VALUES(base_plan_id),
+          purchase_token_last4 = VALUES(purchase_token_last4),
+          subscription_state = VALUES(subscription_state),
+          account_plan_type = VALUES(account_plan_type),
+          account_status = VALUES(account_status),
+          expires_at = VALUES(expires_at),
+          verified_at = CURRENT_TIMESTAMP,
+          raw_response = VALUES(raw_response)
+      `,
+      [
+        account.account_id,
+        userId,
+        GOOGLE_PLAY_STORE,
+        SOLO_PRODUCT_ID,
+        SOLO_BASE_PLAN_ID,
+        purchaseTokenHash,
+        purchaseTokenLast4,
+        subscription?.subscriptionState ?? null,
+        verifiedSolo.planType,
+        verifiedSolo.status,
+        expiresAt,
+        JSON.stringify(subscription),
+      ]
+    );
+
+    await connection.commit();
+
+    const updatedAccount = await getAccountByUserId(pool, userId);
+    const effectivePlan = resolveEffectivePlan(updatedAccount);
+    return {
+      account: updatedAccount,
+      planResponse: await buildPlanResponse(effectivePlan, userId, updatedAccount),
+      subscriptionState: subscription?.subscriptionState ?? null,
+      expiresAt,
+    };
+  } catch (err) {
+    await connection.rollback();
+    throw err;
+  } finally {
+    connection.release();
+  }
+}
+
 async function ensureVoiceSearchUsageSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS voice_search_usage (
@@ -580,6 +889,79 @@ async function ensureVoiceSearchUsageSchema() {
   }
 }
 
+async function ensureBillingPurchaseSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS billing_purchases (
+      id BIGINT NOT NULL AUTO_INCREMENT,
+      account_id BIGINT NOT NULL,
+      user_id CHAR(36) NOT NULL,
+      store VARCHAR(30) NOT NULL,
+      product_id VARCHAR(100) NOT NULL,
+      base_plan_id VARCHAR(100) NULL,
+      purchase_token_hash CHAR(64) NOT NULL,
+      purchase_token_last4 VARCHAR(4) NULL,
+      subscription_state VARCHAR(80) NULL,
+      account_plan_type VARCHAR(10) NOT NULL,
+      account_status VARCHAR(20) NOT NULL,
+      expires_at DATETIME NULL,
+      verified_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      raw_response JSON NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uk_billing_purchase_token_hash (purchase_token_hash),
+      KEY idx_billing_purchases_account_id (account_id),
+      KEY idx_billing_purchases_user_id (user_id)
+    )
+  `);
+
+  const requiredColumns = [
+    ["account_id", "BIGINT NOT NULL"],
+    ["user_id", "CHAR(36) NOT NULL"],
+    ["store", "VARCHAR(30) NOT NULL"],
+    ["product_id", "VARCHAR(100) NOT NULL"],
+    ["base_plan_id", "VARCHAR(100) NULL"],
+    ["purchase_token_hash", "CHAR(64) NOT NULL"],
+    ["purchase_token_last4", "VARCHAR(4) NULL"],
+    ["subscription_state", "VARCHAR(80) NULL"],
+    ["account_plan_type", "VARCHAR(10) NOT NULL"],
+    ["account_status", "VARCHAR(20) NOT NULL"],
+    ["expires_at", "DATETIME NULL"],
+    ["verified_at", "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"],
+    ["raw_response", "JSON NULL"],
+  ];
+
+  for (const [columnName, definition] of requiredColumns) {
+    if (!(await columnExists("billing_purchases", columnName))) {
+      await pool.query(`
+        ALTER TABLE billing_purchases
+        ADD COLUMN ${columnName} ${definition}
+      `);
+    }
+  }
+
+  if (!(await indexExists("billing_purchases", "uk_billing_purchase_token_hash"))) {
+    await pool.query(`
+      ALTER TABLE billing_purchases
+      ADD UNIQUE KEY uk_billing_purchase_token_hash (purchase_token_hash)
+    `);
+  }
+
+  if (!(await indexExists("billing_purchases", "idx_billing_purchases_account_id"))) {
+    await pool.query(`
+      ALTER TABLE billing_purchases
+      ADD KEY idx_billing_purchases_account_id (account_id)
+    `);
+  }
+
+  if (!(await indexExists("billing_purchases", "idx_billing_purchases_user_id"))) {
+    await pool.query(`
+      ALTER TABLE billing_purchases
+      ADD KEY idx_billing_purchases_user_id (user_id)
+    `);
+  }
+}
+
 app.get("/api/account/plan", async (req, res) => {
   const rawUserId = req.query.user_id ?? req.header("X-User-ID");
   const userId = normalizeUserId(rawUserId);
@@ -599,6 +981,66 @@ app.get("/api/account/plan", async (req, res) => {
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/billing/purchases/sync", async (req, res) => {
+  const userId = normalizeUserId(req.body?.user_id ?? req.body?.userId);
+  const store = normalizeStore(req.body?.store ?? GOOGLE_PLAY_STORE);
+  const productId = normalizeRequiredString(
+    req.body?.product_id ?? req.body?.productId
+  );
+  const basePlanId = normalizeRequiredString(
+    req.body?.base_plan_id ?? req.body?.basePlanId
+  );
+  const purchaseToken = normalizeRequiredString(
+    req.body?.purchase_token ?? req.body?.purchaseToken
+  );
+
+  if (!userId) {
+    return res
+      .status(400)
+      .json({ error: "user_id is required and must be a UUID string" });
+  }
+
+  if (store !== GOOGLE_PLAY_STORE) {
+    return res.status(400).json({ error: `store must be ${GOOGLE_PLAY_STORE}` });
+  }
+
+  if (!productId) {
+    return res.status(400).json({ error: "product_id is required" });
+  }
+
+  if (!purchaseToken) {
+    return res.status(400).json({ error: "purchase_token is required" });
+  }
+
+  try {
+    const result = await syncGooglePlaySoloPurchase({
+      userId,
+      productId,
+      basePlanId,
+      purchaseToken,
+    });
+
+    return res.json({
+      status: "ok",
+      store: GOOGLE_PLAY_STORE,
+      productId: SOLO_PRODUCT_ID,
+      basePlanId: SOLO_BASE_PLAN_ID,
+      subscriptionState: result.subscriptionState,
+      expiresAt: result.expiresAt,
+      account: {
+        accountUuid: result.account?.account_uuid ?? null,
+        planType: result.account?.plan_type ?? null,
+        status: result.account?.status ?? null,
+        expiresAt: result.account?.expires_at ?? null,
+      },
+      plan: result.planResponse,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 
@@ -821,6 +1263,7 @@ async function startServer() {
   try {
     await ensureAccountPlanSchema();
     await ensureVoiceSearchUsageSchema();
+    await ensureBillingPurchaseSchema();
     app.listen(port, () => console.log(`API running on port ${port}`));
   } catch (err) {
     console.error("Failed to start server:", err);

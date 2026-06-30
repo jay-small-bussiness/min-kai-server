@@ -1,2 +1,5 @@
 node_modules/
 .env
+min-kai-play-billing-*.json
+*service-account*.json
+*service_account*.json
