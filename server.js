@@ -1015,6 +1015,15 @@ app.post("/api/billing/purchases/sync", async (req, res) => {
     return res.status(400).json({ error: "purchase_token is required" });
   }
 
+  console.log("purchase sync received", {
+    user_id: userId,
+    store,
+    product_id: productId,
+    base_plan_id: basePlanId,
+    tokenLength: purchaseToken.length,
+    tokenHead: purchaseToken.slice(0, 8),
+  });
+
   try {
     const result = await syncGooglePlaySoloPurchase({
       userId,
