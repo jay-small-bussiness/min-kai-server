@@ -1021,7 +1021,7 @@ app.post("/api/billing/purchases/sync", async (req, res) => {
     product_id: productId,
     base_plan_id: basePlanId,
     tokenLength: purchaseToken.length,
-    tokenHead: purchaseToken.slice(0, 8),
+    tokenLast4: purchaseToken.slice(-4),
   });
 
   try {
