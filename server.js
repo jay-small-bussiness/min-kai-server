@@ -27,6 +27,10 @@ const GOOGLE_PLAY_SCOPE = "https://www.googleapis.com/auth/androidpublisher";
 const GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GOOGLE_PLAY_ANDROID_PUBLISHER_URL =
   "https://androidpublisher.googleapis.com/androidpublisher/v3";
+const GOOGLE_PLAY_ACK_PENDING = "ACKNOWLEDGEMENT_STATE_PENDING";
+const GOOGLE_PLAY_ACKNOWLEDGED = "ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED";
+const GOOGLE_PLAY_ACK_MAX_ATTEMPTS = 3;
+const GOOGLE_PLAY_ACK_RETRY_DELAYS_MS = [250, 750];
 const UUID_PATTERN =
   /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
@@ -322,6 +326,77 @@ async function getGooglePlaySubscription(purchaseToken) {
   }
 
   return body;
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function isRetryableGooglePlayStatus(status) {
+  return status === 408 || status === 409 || status === 429 || status >= 500;
+}
+
+async function acknowledgeGooglePlaySubscriptionOnce(purchaseToken) {
+  const packageName = normalizeRequiredString(process.env.GOOGLE_PLAY_PACKAGE_NAME);
+  if (!packageName) {
+    throw new Error("GOOGLE_PLAY_PACKAGE_NAME is not configured");
+  }
+
+  const accessToken = await getGooglePlayAccessToken();
+  const url =
+    `${GOOGLE_PLAY_ANDROID_PUBLISHER_URL}/applications/` +
+    `${encodeURIComponent(packageName)}/purchases/subscriptions/` +
+    `${encodeURIComponent(SOLO_PRODUCT_ID)}/tokens/` +
+    `${encodeURIComponent(purchaseToken)}:acknowledge`;
+
+  let response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({}),
+    });
+  } catch (cause) {
+    const err = new Error("Google Play subscription acknowledgement request failed");
+    err.retryable = true;
+    err.cause = cause;
+    throw err;
+  }
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    const err = new Error(
+      `Google Play subscription acknowledgement failed: ${response.status} ${JSON.stringify(body)}`
+    );
+    err.googleStatus = response.status;
+    err.retryable = isRetryableGooglePlayStatus(response.status);
+    throw err;
+  }
+}
+
+async function acknowledgeGooglePlaySubscriptionWithRetry(purchaseToken) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= GOOGLE_PLAY_ACK_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      await acknowledgeGooglePlaySubscriptionOnce(purchaseToken);
+      return { attempts: attempt, retryCount: attempt - 1 };
+    } catch (err) {
+      lastError = err;
+      if (!err.retryable || attempt === GOOGLE_PLAY_ACK_MAX_ATTEMPTS) {
+        err.attempts = attempt;
+        err.retryCount = attempt - 1;
+        throw err;
+      }
+
+      await wait(GOOGLE_PLAY_ACK_RETRY_DELAYS_MS[attempt - 1]);
+    }
+  }
+
+  throw lastError;
 }
 
 function getMatchingSoloLineItem(subscription) {
@@ -814,7 +889,7 @@ async function syncGooglePlaySoloPurchase({
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
         ON DUPLICATE KEY UPDATE
           account_id = VALUES(account_id),
-          user_id = VALUES(user_id),
+          user_id = billing_purchases.user_id,
           store = VALUES(store),
           product_id = VALUES(product_id),
           base_plan_id = VALUES(base_plan_id),
@@ -844,23 +919,152 @@ async function syncGooglePlaySoloPurchase({
       ]
     );
 
-    await connection.commit();
+    const [purchaseOwners] = await connection.query(
+      `
+        SELECT user_id
+          FROM billing_purchases
+         WHERE purchase_token_hash = ?
+         FOR UPDATE
+      `,
+      [purchaseTokenHash]
+    );
 
-    const updatedAccount = await getAccountByUserId(pool, userId);
-    const effectivePlan = resolveEffectivePlan(updatedAccount);
-    return {
-      account: updatedAccount,
-      planResponse: await buildPlanResponse(effectivePlan, userId, updatedAccount),
-      subscriptionState: subscription?.subscriptionState ?? null,
-      acknowledgementState,
-      expiresAt,
-    };
+    if (purchaseOwners[0]?.user_id !== userId) {
+      const err = new Error("purchase token is already linked to another user");
+      err.statusCode = 409;
+      throw err;
+    }
+
+    await connection.commit();
   } catch (err) {
     await connection.rollback();
     throw err;
   } finally {
     connection.release();
   }
+
+  let finalAcknowledgementState = acknowledgementState;
+  let acknowledgeStatus = "not_required";
+  let acknowledgeRetryCount = 0;
+
+  if (acknowledgementState === GOOGLE_PLAY_ACK_PENDING) {
+    try {
+      const acknowledgeResult =
+        await acknowledgeGooglePlaySubscriptionWithRetry(purchaseToken);
+      acknowledgeRetryCount = acknowledgeResult.retryCount;
+      finalAcknowledgementState = GOOGLE_PLAY_ACKNOWLEDGED;
+      acknowledgeStatus = "acknowledged";
+
+      await pool.query(
+        `
+          UPDATE billing_purchases
+             SET acknowledgement_state = ?,
+                 acknowledged_at = CURRENT_TIMESTAMP,
+                 acknowledge_retry_count = acknowledge_retry_count + ?,
+                 acknowledge_last_attempt_at = CURRENT_TIMESTAMP,
+                 acknowledge_last_error = NULL
+           WHERE purchase_token_hash = ?
+             AND user_id = ?
+        `,
+        [
+          finalAcknowledgementState,
+          acknowledgeRetryCount,
+          purchaseTokenHash,
+          userId,
+        ]
+      );
+    } catch (acknowledgeError) {
+      acknowledgeRetryCount = acknowledgeError.retryCount ?? 0;
+
+      try {
+        const latestSubscription = await getGooglePlaySubscription(purchaseToken);
+        if (
+          latestSubscription?.acknowledgementState === GOOGLE_PLAY_ACKNOWLEDGED
+        ) {
+          finalAcknowledgementState = GOOGLE_PLAY_ACKNOWLEDGED;
+          acknowledgeStatus = "already_acknowledged";
+        } else {
+          finalAcknowledgementState =
+            latestSubscription?.acknowledgementState ?? GOOGLE_PLAY_ACK_PENDING;
+          acknowledgeStatus = "pending_retry";
+        }
+      } catch {
+        finalAcknowledgementState = GOOGLE_PLAY_ACK_PENDING;
+        acknowledgeStatus = "pending_retry";
+      }
+
+      const safeError = acknowledgeError.googleStatus
+        ? `Google Play acknowledgement failed with HTTP ${acknowledgeError.googleStatus}`
+        : "Google Play acknowledgement request failed";
+
+      await pool.query(
+        `
+          UPDATE billing_purchases
+             SET acknowledgement_state = ?,
+                 acknowledged_at = CASE WHEN ? = ? THEN CURRENT_TIMESTAMP ELSE acknowledged_at END,
+                 acknowledge_retry_count = acknowledge_retry_count + ?,
+                 acknowledge_last_attempt_at = CURRENT_TIMESTAMP,
+                 acknowledge_last_error = CASE WHEN ? = ? THEN NULL ELSE ? END
+           WHERE purchase_token_hash = ?
+             AND user_id = ?
+        `,
+        [
+          finalAcknowledgementState,
+          finalAcknowledgementState,
+          GOOGLE_PLAY_ACKNOWLEDGED,
+          acknowledgeRetryCount,
+          finalAcknowledgementState,
+          GOOGLE_PLAY_ACKNOWLEDGED,
+          safeError,
+          purchaseTokenHash,
+          userId,
+        ]
+      );
+
+      console.warn("purchase acknowledgement incomplete", {
+        user_id: userId,
+        acknowledgementState: finalAcknowledgementState,
+        acknowledgeStatus,
+        retryCount: acknowledgeRetryCount,
+        googleStatus: acknowledgeError.googleStatus ?? null,
+        tokenLength: purchaseToken.length,
+        tokenLast4: purchaseTokenLast4,
+      });
+    }
+  } else if (acknowledgementState === GOOGLE_PLAY_ACKNOWLEDGED) {
+    acknowledgeStatus = "already_acknowledged";
+    await pool.query(
+      `
+        UPDATE billing_purchases
+           SET acknowledged_at = COALESCE(acknowledged_at, CURRENT_TIMESTAMP),
+               acknowledge_last_error = NULL
+         WHERE purchase_token_hash = ?
+           AND user_id = ?
+      `,
+      [purchaseTokenHash, userId]
+    );
+  }
+
+  console.log("purchase acknowledgement result", {
+    user_id: userId,
+    acknowledgementState: finalAcknowledgementState,
+    acknowledgeStatus,
+    retryCount: acknowledgeRetryCount,
+    tokenLength: purchaseToken.length,
+    tokenLast4: purchaseTokenLast4,
+  });
+
+  const updatedAccount = await getAccountByUserId(pool, userId);
+  const effectivePlan = resolveEffectivePlan(updatedAccount);
+  return {
+    account: updatedAccount,
+    planResponse: await buildPlanResponse(effectivePlan, userId, updatedAccount),
+    subscriptionState: subscription?.subscriptionState ?? null,
+    acknowledgementState: finalAcknowledgementState,
+    acknowledgeStatus,
+    acknowledgeRetryCount,
+    expiresAt,
+  };
 }
 
 async function ensureVoiceSearchUsageSchema() {
@@ -1065,6 +1269,8 @@ app.post("/api/billing/purchases/sync", async (req, res) => {
       basePlanId: SOLO_BASE_PLAN_ID,
       subscriptionState: result.subscriptionState,
       acknowledgementState: result.acknowledgementState,
+      acknowledgeStatus: result.acknowledgeStatus,
+      acknowledgeRetryCount: result.acknowledgeRetryCount,
       expiresAt: result.expiresAt,
       account: {
         accountUuid: result.account?.account_uuid ?? null,
