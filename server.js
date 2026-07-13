@@ -750,12 +750,24 @@ async function syncGooglePlaySoloPurchase({
   const account = await findOrCreateAccountByUserId(userId);
   const subscription = await getGooglePlaySubscription(purchaseToken);
   const verifiedSolo = resolveSoloStatusFromGooglePlay(subscription);
+  const soloLineItem = getMatchingSoloLineItem(subscription);
+  const acknowledgementState = subscription?.acknowledgementState ?? null;
 
   if (!verifiedSolo.matchesSoloProduct) {
     const err = new Error("purchase token does not match the Solo monthly product");
     err.statusCode = 409;
     throw err;
   }
+
+  console.log("purchase verification result", {
+    subscriptionState: subscription?.subscriptionState ?? null,
+    acknowledgementState,
+    productId: soloLineItem?.productId ?? null,
+    basePlanId: soloLineItem?.offerDetails?.basePlanId ?? null,
+    expiryTime: soloLineItem?.expiryTime ?? null,
+    tokenLength: purchaseToken.length,
+    tokenLast4: purchaseToken.slice(-4),
+  });
 
   const connection = await pool.getConnection();
   const purchaseTokenHash = hashPurchaseToken(purchaseToken);
@@ -792,13 +804,14 @@ async function syncGooglePlaySoloPurchase({
           purchase_token_hash,
           purchase_token_last4,
           subscription_state,
+          acknowledgement_state,
           account_plan_type,
           account_status,
           expires_at,
           verified_at,
           raw_response
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
         ON DUPLICATE KEY UPDATE
           account_id = VALUES(account_id),
           user_id = VALUES(user_id),
@@ -807,6 +820,7 @@ async function syncGooglePlaySoloPurchase({
           base_plan_id = VALUES(base_plan_id),
           purchase_token_last4 = VALUES(purchase_token_last4),
           subscription_state = VALUES(subscription_state),
+          acknowledgement_state = VALUES(acknowledgement_state),
           account_plan_type = VALUES(account_plan_type),
           account_status = VALUES(account_status),
           expires_at = VALUES(expires_at),
@@ -822,6 +836,7 @@ async function syncGooglePlaySoloPurchase({
         purchaseTokenHash,
         purchaseTokenLast4,
         subscription?.subscriptionState ?? null,
+        acknowledgementState,
         verifiedSolo.planType,
         verifiedSolo.status,
         expiresAt,
@@ -837,6 +852,7 @@ async function syncGooglePlaySoloPurchase({
       account: updatedAccount,
       planResponse: await buildPlanResponse(effectivePlan, userId, updatedAccount),
       subscriptionState: subscription?.subscriptionState ?? null,
+      acknowledgementState,
       expiresAt,
     };
   } catch (err) {
@@ -901,6 +917,11 @@ async function ensureBillingPurchaseSchema() {
       purchase_token_hash CHAR(64) NOT NULL,
       purchase_token_last4 VARCHAR(4) NULL,
       subscription_state VARCHAR(80) NULL,
+      acknowledgement_state VARCHAR(50) NULL,
+      acknowledged_at DATETIME NULL,
+      acknowledge_retry_count INT NOT NULL DEFAULT 0,
+      acknowledge_last_attempt_at DATETIME NULL,
+      acknowledge_last_error VARCHAR(500) NULL,
       account_plan_type VARCHAR(10) NOT NULL,
       account_status VARCHAR(20) NOT NULL,
       expires_at DATETIME NULL,
@@ -924,6 +945,11 @@ async function ensureBillingPurchaseSchema() {
     ["purchase_token_hash", "CHAR(64) NOT NULL"],
     ["purchase_token_last4", "VARCHAR(4) NULL"],
     ["subscription_state", "VARCHAR(80) NULL"],
+    ["acknowledgement_state", "VARCHAR(50) NULL"],
+    ["acknowledged_at", "DATETIME NULL"],
+    ["acknowledge_retry_count", "INT NOT NULL DEFAULT 0"],
+    ["acknowledge_last_attempt_at", "DATETIME NULL"],
+    ["acknowledge_last_error", "VARCHAR(500) NULL"],
     ["account_plan_type", "VARCHAR(10) NOT NULL"],
     ["account_status", "VARCHAR(20) NOT NULL"],
     ["expires_at", "DATETIME NULL"],
@@ -1038,6 +1064,7 @@ app.post("/api/billing/purchases/sync", async (req, res) => {
       productId: SOLO_PRODUCT_ID,
       basePlanId: SOLO_BASE_PLAN_ID,
       subscriptionState: result.subscriptionState,
+      acknowledgementState: result.acknowledgementState,
       expiresAt: result.expiresAt,
       account: {
         accountUuid: result.account?.account_uuid ?? null,
