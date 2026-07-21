@@ -43,6 +43,10 @@ const UUID_PATTERN =
 
 let googleAccessTokenCache = null;
 
+function getIdentifierLast4(value) {
+  return typeof value === "string" && value.length > 0 ? value.slice(-4) : null;
+}
+
 function getJstDayRangeUtc(now = new Date()) {
   const jstOffsetMinutes = 9 * 60;
   const jstNow = new Date(now.getTime() + jstOffsetMinutes * 60 * 1000);
@@ -1185,7 +1189,7 @@ async function syncGooglePlaySoloPurchase({
   });
 
   console.log("purchase account link result", {
-    user_id: userId,
+    userIdLast4: getIdentifierLast4(userId),
     accountLinkStatus: purchasePersistence.accountLinkStatus,
     linkedDeviceCount: purchasePersistence.linkedDeviceCount,
     tokenLength: purchaseToken.length,
@@ -1267,7 +1271,7 @@ async function syncGooglePlaySoloPurchase({
       );
 
       console.warn("purchase acknowledgement incomplete", {
-        user_id: userId,
+        userIdLast4: getIdentifierLast4(userId),
         acknowledgementState: finalAcknowledgementState,
         acknowledgeStatus,
         retryCount: acknowledgeRetryCount,
@@ -1290,7 +1294,7 @@ async function syncGooglePlaySoloPurchase({
   }
 
   console.log("purchase acknowledgement result", {
-    user_id: userId,
+    userIdLast4: getIdentifierLast4(userId),
     acknowledgementState: finalAcknowledgementState,
     acknowledgeStatus,
     retryCount: acknowledgeRetryCount,
@@ -1492,7 +1496,7 @@ app.post("/api/billing/purchases/sync", async (req, res) => {
   }
 
   console.log("purchase sync received", {
-    user_id: userId,
+    userIdLast4: getIdentifierLast4(userId),
     store,
     product_id: productId,
     base_plan_id: basePlanId,
@@ -1506,6 +1510,19 @@ app.post("/api/billing/purchases/sync", async (req, res) => {
       productId,
       basePlanId,
       purchaseToken,
+    });
+
+    console.log("purchase sync completed", {
+      httpStatus: 200,
+      userIdLast4: getIdentifierLast4(userId),
+      accountUuidLast4: getIdentifierLast4(result.account?.account_uuid),
+      accountLinkStatus: result.accountLinkStatus,
+      linkedDeviceCount: result.linkedDeviceCount,
+      acknowledgementState: result.acknowledgementState,
+      acknowledgeStatus: result.acknowledgeStatus,
+      plan: result.planResponse?.plan ?? null,
+      tokenLength: purchaseToken.length,
+      tokenLast4: purchaseToken.slice(-4),
     });
 
     return res.json({
@@ -1529,8 +1546,16 @@ app.post("/api/billing/purchases/sync", async (req, res) => {
       plan: result.planResponse,
     });
   } catch (err) {
-    console.error(err);
-    return res.status(err.statusCode || 500).json({ error: err.message });
+    const httpStatus = err.statusCode || 500;
+    console.error("purchase sync failed", {
+      httpStatus,
+      googleStatus: err.googleStatus ?? null,
+      userIdLast4: getIdentifierLast4(userId),
+      errorName: err.name ?? "Error",
+      tokenLength: purchaseToken.length,
+      tokenLast4: purchaseToken.slice(-4),
+    });
+    return res.status(httpStatus).json({ error: err.message });
   }
 });
 
