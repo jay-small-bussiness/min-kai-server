@@ -31,6 +31,13 @@ const GOOGLE_PLAY_ACK_PENDING = "ACKNOWLEDGEMENT_STATE_PENDING";
 const GOOGLE_PLAY_ACKNOWLEDGED = "ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED";
 const GOOGLE_PLAY_ACK_MAX_ATTEMPTS = 3;
 const GOOGLE_PLAY_ACK_RETRY_DELAYS_MS = [250, 750];
+const BILLING_TRANSACTION_MAX_ATTEMPTS = 3;
+const BILLING_TRANSACTION_RETRY_DELAYS_MS = [100, 300];
+const RETRYABLE_MYSQL_CODES = new Set([
+  "ER_DUP_ENTRY",
+  "ER_LOCK_DEADLOCK",
+  "ER_LOCK_WAIT_TIMEOUT",
+]);
 const UUID_PATTERN =
   /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
@@ -314,15 +321,22 @@ async function getGooglePlaySubscription(purchaseToken) {
     `${encodeURIComponent(packageName)}/purchases/subscriptionsv2/tokens/` +
     encodeURIComponent(purchaseToken);
 
-  const response = await fetch(url, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
+  let response;
+  try {
+    response = await fetch(url, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+  } catch {
+    throw new Error("Google Play subscription verification request failed");
+  }
 
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(
-      `Google Play subscription verification failed: ${response.status} ${JSON.stringify(body)}`
+    const err = new Error(
+      `Google Play subscription verification failed with HTTP ${response.status}`
     );
+    err.googleStatus = response.status;
+    throw err;
   }
 
   return body;
@@ -367,9 +381,8 @@ async function acknowledgeGooglePlaySubscriptionOnce(purchaseToken) {
   }
 
   if (!response.ok) {
-    const body = await response.json().catch(() => ({}));
     const err = new Error(
-      `Google Play subscription acknowledgement failed: ${response.status} ${JSON.stringify(body)}`
+      `Google Play subscription acknowledgement failed with HTTP ${response.status}`
     );
     err.googleStatus = response.status;
     err.retryable = isRetryableGooglePlayStatus(response.status);
@@ -804,6 +817,316 @@ async function findOrCreateAccountByUserId(userId) {
   }
 }
 
+async function getAccountLinkForUpdate(connection, userId) {
+  const [rows] = await connection.query(
+    `
+      SELECT
+        au.id AS account_user_id,
+        au.account_id,
+        au.unlinked_at,
+        a.account_uuid,
+        a.plan_type,
+        a.status,
+        a.expires_at
+      FROM account_users au
+      INNER JOIN accounts a ON a.id = au.account_id
+      WHERE au.user_id = ?
+      LIMIT 1
+      FOR UPDATE
+    `,
+    [userId]
+  );
+
+  return rows[0] ?? null;
+}
+
+async function getAccountByIdForUpdate(connection, accountId) {
+  const [rows] = await connection.query(
+    `
+      SELECT
+        id AS account_id,
+        account_uuid,
+        plan_type,
+        status,
+        expires_at
+      FROM accounts
+      WHERE id = ?
+      LIMIT 1
+      FOR UPDATE
+    `,
+    [accountId]
+  );
+
+  return rows[0] ?? null;
+}
+
+async function getBillingPurchaseForUpdate(connection, purchaseTokenHash) {
+  const [rows] = await connection.query(
+    `
+      SELECT id, account_id, user_id
+      FROM billing_purchases
+      WHERE purchase_token_hash = ?
+      LIMIT 1
+      FOR UPDATE
+    `,
+    [purchaseTokenHash]
+  );
+
+  return rows[0] ?? null;
+}
+
+async function persistVerifiedSoloPurchase({
+  userId,
+  purchaseTokenHash,
+  purchaseTokenLast4,
+  subscription,
+  acknowledgementState,
+  verifiedSolo,
+}) {
+  let lastError;
+
+  for (
+    let attempt = 1;
+    attempt <= BILLING_TRANSACTION_MAX_ATTEMPTS;
+    attempt += 1
+  ) {
+    const connection = await pool.getConnection();
+
+    try {
+      await connection.beginTransaction();
+
+      const existingPurchase = await getBillingPurchaseForUpdate(
+        connection,
+        purchaseTokenHash
+      );
+      const currentLink = await getAccountLinkForUpdate(connection, userId);
+      const currentActiveAccount =
+        currentLink && currentLink.unlinked_at === null ? currentLink : null;
+
+      let targetAccountId;
+      let accountLinkStatus;
+
+      if (existingPurchase) {
+        targetAccountId = existingPurchase.account_id;
+
+        if (currentActiveAccount?.account_id === targetAccountId) {
+          accountLinkStatus = "existing_link";
+        } else {
+          if (
+            currentActiveAccount &&
+            resolveEffectivePlan(currentActiveAccount) === "Solo"
+          ) {
+            const err = new Error(
+              "user is already linked to another active paid account"
+            );
+            err.statusCode = 409;
+            throw err;
+          }
+
+          if (currentLink) {
+            await connection.query(
+              `
+                UPDATE account_users
+                   SET account_id = ?,
+                       linked_at = CURRENT_TIMESTAMP,
+                       unlinked_at = NULL
+                 WHERE id = ?
+              `,
+              [targetAccountId, currentLink.account_user_id]
+            );
+          } else {
+            await connection.query(
+              `
+                INSERT INTO account_users (
+                  account_id,
+                  user_id,
+                  linked_at,
+                  unlinked_at
+                )
+                VALUES (?, ?, CURRENT_TIMESTAMP, NULL)
+              `,
+              [targetAccountId, userId]
+            );
+          }
+
+          accountLinkStatus = "linked_existing_purchase";
+        }
+      } else {
+        if (currentActiveAccount) {
+          targetAccountId = currentActiveAccount.account_id;
+        } else if (currentLink) {
+          targetAccountId = currentLink.account_id;
+          await connection.query(
+            `
+              UPDATE account_users
+                 SET linked_at = CURRENT_TIMESTAMP,
+                     unlinked_at = NULL
+               WHERE id = ?
+            `,
+            [currentLink.account_user_id]
+          );
+        } else {
+          const accountUuid = randomUUID();
+          const [accountResult] = await connection.query(
+            `
+              INSERT INTO accounts (account_uuid, plan_type, status, expires_at)
+              VALUES (?, 'solo', ?, ?)
+            `,
+            [accountUuid, verifiedSolo.status, verifiedSolo.expiresAt]
+          );
+          targetAccountId = accountResult.insertId;
+
+          await connection.query(
+            `
+              INSERT INTO account_users (
+                account_id,
+                user_id,
+                linked_at,
+                unlinked_at
+              )
+              VALUES (?, ?, CURRENT_TIMESTAMP, NULL)
+            `,
+            [targetAccountId, userId]
+          );
+        }
+
+        accountLinkStatus = "created_new_purchase";
+      }
+
+      const targetAccount = await getAccountByIdForUpdate(
+        connection,
+        targetAccountId
+      );
+      if (!targetAccount) {
+        throw new Error("billing purchase account does not exist");
+      }
+
+      await connection.query(
+        `
+          UPDATE accounts
+             SET plan_type = ?,
+                 status = ?,
+                 expires_at = ?
+           WHERE id = ?
+        `,
+        [
+          verifiedSolo.planType,
+          verifiedSolo.status,
+          verifiedSolo.expiresAt,
+          targetAccountId,
+        ]
+      );
+
+      if (existingPurchase) {
+        await connection.query(
+          `
+            UPDATE billing_purchases
+               SET store = ?,
+                   product_id = ?,
+                   base_plan_id = ?,
+                   purchase_token_last4 = ?,
+                   subscription_state = ?,
+                   acknowledgement_state = ?,
+                   account_plan_type = ?,
+                   account_status = ?,
+                   expires_at = ?,
+                   verified_at = CURRENT_TIMESTAMP,
+                   raw_response = ?
+             WHERE id = ?
+          `,
+          [
+            GOOGLE_PLAY_STORE,
+            SOLO_PRODUCT_ID,
+            SOLO_BASE_PLAN_ID,
+            purchaseTokenLast4,
+            subscription?.subscriptionState ?? null,
+            acknowledgementState,
+            verifiedSolo.planType,
+            verifiedSolo.status,
+            verifiedSolo.expiresAt,
+            JSON.stringify(subscription),
+            existingPurchase.id,
+          ]
+        );
+      } else {
+        await connection.query(
+          `
+            INSERT INTO billing_purchases (
+              account_id,
+              user_id,
+              store,
+              product_id,
+              base_plan_id,
+              purchase_token_hash,
+              purchase_token_last4,
+              subscription_state,
+              acknowledgement_state,
+              account_plan_type,
+              account_status,
+              expires_at,
+              verified_at,
+              raw_response
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+          `,
+          [
+            targetAccountId,
+            userId,
+            GOOGLE_PLAY_STORE,
+            SOLO_PRODUCT_ID,
+            SOLO_BASE_PLAN_ID,
+            purchaseTokenHash,
+            purchaseTokenLast4,
+            subscription?.subscriptionState ?? null,
+            acknowledgementState,
+            verifiedSolo.planType,
+            verifiedSolo.status,
+            verifiedSolo.expiresAt,
+            JSON.stringify(subscription),
+          ]
+        );
+      }
+
+      const [linkedDeviceRows] = await connection.query(
+        `
+          SELECT COUNT(*) AS linked_device_count
+          FROM account_users
+          WHERE account_id = ?
+            AND unlinked_at IS NULL
+        `,
+        [targetAccountId]
+      );
+
+      await connection.commit();
+
+      return {
+        accountId: targetAccountId,
+        accountLinkStatus,
+        linkedDeviceCount: Number(
+          linkedDeviceRows[0]?.linked_device_count ?? 0
+        ),
+      };
+    } catch (err) {
+      lastError = err;
+      await connection.rollback().catch(() => {});
+
+      if (
+        !RETRYABLE_MYSQL_CODES.has(err?.code) ||
+        err?.statusCode ||
+        attempt === BILLING_TRANSACTION_MAX_ATTEMPTS
+      ) {
+        throw err;
+      }
+    } finally {
+      connection.release();
+    }
+
+    await wait(BILLING_TRANSACTION_RETRY_DELAYS_MS[attempt - 1]);
+  }
+
+  throw lastError;
+}
+
 async function syncGooglePlaySoloPurchase({
   userId,
   productId,
@@ -822,7 +1145,6 @@ async function syncGooglePlaySoloPurchase({
     throw err;
   }
 
-  const account = await findOrCreateAccountByUserId(userId);
   const subscription = await getGooglePlaySubscription(purchaseToken);
   const verifiedSolo = resolveSoloStatusFromGooglePlay(subscription);
   const soloLineItem = getMatchingSoloLineItem(subscription);
@@ -830,6 +1152,12 @@ async function syncGooglePlaySoloPurchase({
 
   if (!verifiedSolo.matchesSoloProduct) {
     const err = new Error("purchase token does not match the Solo monthly product");
+    err.statusCode = 409;
+    throw err;
+  }
+
+  if (verifiedSolo.planType !== "solo") {
+    const err = new Error("purchase is not an active Solo subscription");
     err.statusCode = 409;
     throw err;
   }
@@ -844,104 +1172,25 @@ async function syncGooglePlaySoloPurchase({
     tokenLast4: purchaseToken.slice(-4),
   });
 
-  const connection = await pool.getConnection();
   const purchaseTokenHash = hashPurchaseToken(purchaseToken);
   const purchaseTokenLast4 = purchaseToken.slice(-4);
   const expiresAt = verifiedSolo.expiresAt;
+  const purchasePersistence = await persistVerifiedSoloPurchase({
+    userId,
+    purchaseTokenHash,
+    purchaseTokenLast4,
+    subscription,
+    acknowledgementState,
+    verifiedSolo,
+  });
 
-  try {
-    await connection.beginTransaction();
-
-    await connection.query(
-      `
-        UPDATE accounts
-           SET plan_type = ?,
-               status = ?,
-               expires_at = ?
-         WHERE id = ?
-      `,
-      [
-        verifiedSolo.planType,
-        verifiedSolo.status,
-        expiresAt,
-        account.account_id,
-      ]
-    );
-
-    await connection.query(
-      `
-        INSERT INTO billing_purchases (
-          account_id,
-          user_id,
-          store,
-          product_id,
-          base_plan_id,
-          purchase_token_hash,
-          purchase_token_last4,
-          subscription_state,
-          acknowledgement_state,
-          account_plan_type,
-          account_status,
-          expires_at,
-          verified_at,
-          raw_response
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
-        ON DUPLICATE KEY UPDATE
-          account_id = VALUES(account_id),
-          user_id = billing_purchases.user_id,
-          store = VALUES(store),
-          product_id = VALUES(product_id),
-          base_plan_id = VALUES(base_plan_id),
-          purchase_token_last4 = VALUES(purchase_token_last4),
-          subscription_state = VALUES(subscription_state),
-          acknowledgement_state = VALUES(acknowledgement_state),
-          account_plan_type = VALUES(account_plan_type),
-          account_status = VALUES(account_status),
-          expires_at = VALUES(expires_at),
-          verified_at = CURRENT_TIMESTAMP,
-          raw_response = VALUES(raw_response)
-      `,
-      [
-        account.account_id,
-        userId,
-        GOOGLE_PLAY_STORE,
-        SOLO_PRODUCT_ID,
-        SOLO_BASE_PLAN_ID,
-        purchaseTokenHash,
-        purchaseTokenLast4,
-        subscription?.subscriptionState ?? null,
-        acknowledgementState,
-        verifiedSolo.planType,
-        verifiedSolo.status,
-        expiresAt,
-        JSON.stringify(subscription),
-      ]
-    );
-
-    const [purchaseOwners] = await connection.query(
-      `
-        SELECT user_id
-          FROM billing_purchases
-         WHERE purchase_token_hash = ?
-         FOR UPDATE
-      `,
-      [purchaseTokenHash]
-    );
-
-    if (purchaseOwners[0]?.user_id !== userId) {
-      const err = new Error("purchase token is already linked to another user");
-      err.statusCode = 409;
-      throw err;
-    }
-
-    await connection.commit();
-  } catch (err) {
-    await connection.rollback();
-    throw err;
-  } finally {
-    connection.release();
-  }
+  console.log("purchase account link result", {
+    user_id: userId,
+    accountLinkStatus: purchasePersistence.accountLinkStatus,
+    linkedDeviceCount: purchasePersistence.linkedDeviceCount,
+    tokenLength: purchaseToken.length,
+    tokenLast4: purchaseTokenLast4,
+  });
 
   let finalAcknowledgementState = acknowledgementState;
   let acknowledgeStatus = "not_required";
@@ -964,13 +1213,11 @@ async function syncGooglePlaySoloPurchase({
                  acknowledge_last_attempt_at = CURRENT_TIMESTAMP,
                  acknowledge_last_error = NULL
            WHERE purchase_token_hash = ?
-             AND user_id = ?
         `,
         [
           finalAcknowledgementState,
           acknowledgeRetryCount,
           purchaseTokenHash,
-          userId,
         ]
       );
     } catch (acknowledgeError) {
@@ -1006,7 +1253,6 @@ async function syncGooglePlaySoloPurchase({
                  acknowledge_last_attempt_at = CURRENT_TIMESTAMP,
                  acknowledge_last_error = CASE WHEN ? = ? THEN NULL ELSE ? END
            WHERE purchase_token_hash = ?
-             AND user_id = ?
         `,
         [
           finalAcknowledgementState,
@@ -1017,7 +1263,6 @@ async function syncGooglePlaySoloPurchase({
           GOOGLE_PLAY_ACKNOWLEDGED,
           safeError,
           purchaseTokenHash,
-          userId,
         ]
       );
 
@@ -1039,9 +1284,8 @@ async function syncGooglePlaySoloPurchase({
            SET acknowledged_at = COALESCE(acknowledged_at, CURRENT_TIMESTAMP),
                acknowledge_last_error = NULL
          WHERE purchase_token_hash = ?
-           AND user_id = ?
       `,
-      [purchaseTokenHash, userId]
+      [purchaseTokenHash]
     );
   }
 
@@ -1063,6 +1307,8 @@ async function syncGooglePlaySoloPurchase({
     acknowledgementState: finalAcknowledgementState,
     acknowledgeStatus,
     acknowledgeRetryCount,
+    accountLinkStatus: purchasePersistence.accountLinkStatus,
+    linkedDeviceCount: purchasePersistence.linkedDeviceCount,
     expiresAt,
   };
 }
@@ -1271,6 +1517,8 @@ app.post("/api/billing/purchases/sync", async (req, res) => {
       acknowledgementState: result.acknowledgementState,
       acknowledgeStatus: result.acknowledgeStatus,
       acknowledgeRetryCount: result.acknowledgeRetryCount,
+      accountLinkStatus: result.accountLinkStatus,
+      linkedDeviceCount: result.linkedDeviceCount,
       expiresAt: result.expiresAt,
       account: {
         accountUuid: result.account?.account_uuid ?? null,
